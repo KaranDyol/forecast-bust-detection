@@ -74,13 +74,47 @@ html, body, [class*="css"] {{
     color: {PALETTE['espresso']};
 }}
 
+header[data-testid="stHeader"] {{
+    background: rgba(254, 243, 226, 0.88);
+    backdrop-filter: blur(6px);
+}}
+
+[data-testid="stAppViewContainer"],
+[data-testid="stMain"] {{
+    overflow-x: clip;
+}}
+
 [data-testid="stSidebar"] {{
     border-right: 1px solid {PALETTE['border']};
 }}
 
-.block-container {{
-    padding: clamp(1.1rem, 2.5vw, 2rem) clamp(0.9rem, 3vw, 2.2rem) 2.5rem;
+.block-container,
+[data-testid="stMainBlockContainer"] {{
+    padding: clamp(3.9rem, 5vw, 4.6rem) clamp(0.85rem, 2.8vw, 2.2rem) 4.5rem !important;
     max-width: 1260px;
+}}
+
+[data-testid="stHorizontalBlock"] {{
+    flex-wrap: wrap !important;
+    gap: 1rem !important;
+}}
+
+[data-testid="stHorizontalBlock"] > [data-testid="stColumn"],
+[data-testid="stHorizontalBlock"] > div[data-testid="column"] {{
+    min-width: 0 !important;
+}}
+
+[data-testid="stPlotlyChart"],
+[data-testid="stDataFrame"],
+[data-testid="stCustomComponentV1"] {{
+    max-width: 100% !important;
+}}
+
+.section-divider {{
+    height: 1px;
+    border: none;
+    background-color: {PALETTE['border']};
+    margin: 0.75rem 0 1.15rem 0;
 }}
 
 .header-wrap {{
@@ -276,6 +310,8 @@ html, body, [class*="css"] {{
 }}
 
 iframe {{
+    display: block;
+    max-width: 100% !important;
     border-radius: 10px !important;
     border: 1px solid {PALETTE['border']} !important;
     box-shadow: 0 6px 18px -8px rgba(42, 26, 14, 0.12);
@@ -385,13 +421,30 @@ iframe {{
     color: {PALETTE['muted_brown']};
 }}
 
-/* Tablet breakpoint */
+.kpi-card, .driver-card, .station-panel {{
+    min-width: 0;
+    overflow-wrap: break-word;
+}}
+
+/* Tablet breakpoint: keep 2x2 KPIs, stack columns & driver cards cleanly (avoid 2+1 orphan row) */
 @media (max-width: 1024px) {{
     .kpi-grid {{
         grid-template-columns: repeat(2, minmax(0, 1fr));
     }}
+}}
+
+@media (max-width: 900px) {{
+    [data-testid="stHorizontalBlock"] {{
+        flex-direction: column !important;
+    }}
+    [data-testid="stHorizontalBlock"] > [data-testid="stColumn"],
+    [data-testid="stHorizontalBlock"] > div[data-testid="column"] {{
+        width: 100% !important;
+        flex: 1 1 100% !important;
+        max-width: 100% !important;
+    }}
     .driver-grid {{
-        grid-template-columns: repeat(2, minmax(0, 1fr));
+        grid-template-columns: 1fr;
     }}
 }}
 
@@ -403,6 +456,9 @@ iframe {{
     }}
     .kpi-card {{
         padding: 12px;
+    }}
+    .kpi-sub {{
+        white-space: normal;
     }}
     .driver-grid {{
         grid-template-columns: 1fr;
@@ -776,11 +832,12 @@ st.markdown(
 )
 
 india_map = folium.Map(
-    location=[22.6, 79.2],
-    zoom_start=5,
+    location=[22.2, 80.5],
+    zoom_start=4,
     tiles="OpenStreetMap",
     control_scale=True,
 )
+india_map.fit_bounds([[8.0, 68.5], [35.2, 95.5]])
 
 # Subtle warm parchment tint on map tiles so OSM blends naturally with #FEF3E2
 india_map.get_root().header.add_child(
@@ -845,11 +902,11 @@ for _, row in df_stations.iterrows():
     ).add_to(india_map)
 
 # returned_objects=[] avoids triggering a full script rerun on map pan/zoom
-st_folium(india_map, use_container_width=True, height=470, returned_objects=[])
+st_folium(india_map, use_container_width=True, height=430, returned_objects=[])
 
 
 # Explainable AI Insights
-st.markdown("---")
+st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
 st.subheader("Explainable AI Insights")
 st.caption("Select a station below to inspect the SHAP attribution behind its bust probability.")
 
@@ -933,7 +990,16 @@ Horizon: Day +{lead_day} ({lead_day * 24}h) &middot; Attribution via {shap_resul
     )
 
 with col_chart:
-    feat_labels = [f["feature"].replace("_", " ").title() for f in factors]
+    chart_labels = {
+        "pressure_drop": "Pressure Drop",
+        "wind_shear": "Wind Shear",
+        "predicted_rainfall": "Forecast Rain",
+        "predicted_temp": "Forecast Temp",
+    }
+    feat_labels = [
+        chart_labels.get(f["feature"], f["feature"].replace("_", " ").title())
+        for f in factors
+    ]
     shap_vals = [f["shap_value"] for f in factors]
     bar_colors = [PALETTE["terracotta"] if v > 0 else PALETTE["sage_green"] for v in shap_vals]
     hover_text = [
@@ -951,36 +1017,39 @@ with col_chart:
             orientation="h",
             marker=dict(color=bar_colors, line=dict(color=PALETTE["espresso"], width=0.8)),
             text=[f"{v:+.3f}" for v in shap_vals],
-            textposition="outside",
-            textfont=dict(color=PALETTE["espresso"], family="IBM Plex Mono, monospace", size=12),
+            textposition="auto",
+            insidetextanchor="middle",
+            insidetextfont=dict(color="#FFF9F0", family="IBM Plex Mono, monospace", size=11),
+            outsidetextfont=dict(color=PALETTE["espresso"], family="IBM Plex Mono, monospace", size=11),
             hoverinfo="text",
             hovertext=hover_text,
-            cliponaxis=False,
         )
     )
 
-    max_abs = max([abs(v) for v in shap_vals] + [0.05]) * 1.32
+    max_abs = max([abs(v) for v in shap_vals] + [0.06]) * 1.48
     fig.update_layout(
         title=dict(
-            text=f"Top Root Cause Drivers — {sel['station_name'].split(' (')[0]}",
-            font=dict(size=15, color=PALETTE["espresso"], family="DM Sans, sans-serif"),
+            text=f"SHAP Drivers — {sel['station_name'].split(' (')[0]}",
+            x=0.02,
+            font=dict(size=14, color=PALETTE["espresso"], family="DM Sans, sans-serif"),
         ),
         xaxis=dict(
-            title=dict(text="SHAP Contribution (Log-Odds)", font=dict(size=12, color=PALETTE["muted_brown"])),
+            title=dict(text="SHAP Contribution (Log-Odds)", font=dict(size=11.5, color=PALETTE["muted_brown"])),
             range=[-max_abs, max_abs],
             zeroline=True,
             zerolinecolor=PALETTE["espresso"],
             zerolinewidth=1.4,
             gridcolor="#EDE0C9",
-            tickfont=dict(color=PALETTE["muted_brown"], family="IBM Plex Mono, monospace", size=11),
+            tickfont=dict(color=PALETTE["muted_brown"], family="IBM Plex Mono, monospace", size=10.5),
         ),
         yaxis=dict(
             autorange="reversed",
-            tickfont=dict(color=PALETTE["espresso"], size=12),
+            automargin=True,
+            tickfont=dict(color=PALETTE["espresso"], size=11.5),
         ),
         paper_bgcolor=PALETTE["surface"],
         plot_bgcolor=PALETTE["cream"],
-        margin=dict(l=12, r=36, t=46, b=36),
+        margin=dict(l=10, r=20, t=46, b=38),
         height=315,
         transition=dict(duration=380, easing="cubic-in-out"),
     )
@@ -1011,6 +1080,7 @@ st.markdown(
 
 # Station Table
 with st.expander("View All 18 Synoptic Stations"):
+    st.caption("Sorted highest-to-lowest bust risk. Swipe horizontally on compact screens to view all synoptic metrics.")
     table_df = df_stations[
         [
             "station_name",
@@ -1029,13 +1099,13 @@ with st.expander("View All 18 Synoptic Stations"):
         width="stretch",
         hide_index=True,
         column_config={
-            "station_name": "Station",
-            "zone": "Zone",
-            "risk_percentage": st.column_config.NumberColumn("Bust Risk", format="%.1f%%"),
-            "risk_level": "Tier",
-            "predicted_temp": st.column_config.NumberColumn("Temp", format="%.1f °C"),
-            "predicted_rainfall": st.column_config.NumberColumn("Rain", format="%.1f mm"),
-            "pressure_drop": st.column_config.NumberColumn("Pressure Drop", format="%.2f hPa"),
-            "wind_shear": st.column_config.NumberColumn("Wind Shear", format="%.2f m/s"),
+            "station_name": st.column_config.TextColumn("Station", width="medium"),
+            "zone": st.column_config.TextColumn("Zone", width="small"),
+            "risk_percentage": st.column_config.NumberColumn("Risk", format="%.1f%%", width="small"),
+            "risk_level": st.column_config.TextColumn("Tier", width="small"),
+            "predicted_temp": st.column_config.NumberColumn("Temp", format="%.1f °C", width="small"),
+            "predicted_rainfall": st.column_config.NumberColumn("Rain", format="%.1f mm", width="small"),
+            "pressure_drop": st.column_config.NumberColumn("ΔPress", format="%.1f hPa", width="small"),
+            "wind_shear": st.column_config.NumberColumn("Shear", format="%.1f m/s", width="small"),
         },
     )
