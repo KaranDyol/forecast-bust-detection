@@ -1,10 +1,15 @@
 [server]
 headless = true
-port = 8501
-address = "localhost"
 
 [browser]
 gatherUsageStats = false
 
 [client]
 toolbarMode = "minimal"
+
+[theme]
+primaryColor = "#D4621A"
+backgroundColor = "#FEF3E2"
+secondaryBackgroundColor = "#F8E5C8"
+textColor = "#2A1A0E"
+font = "sans serif"
