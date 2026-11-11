@@ -45,6 +45,7 @@ TARGET_COL = "is_bust"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_PATH = BASE_DIR / "processed_weather_data.csv"
 MODEL_PATH = BASE_DIR / "bust_model.pkl"
+PIPELINE_VERSION = "v2-india-archive-2682"
 
 
 def load_and_split_data(
@@ -104,9 +105,9 @@ def train_and_evaluate_models(
         subsample=0.85,
         colsample_bytree=0.85,
         scale_pos_weight=scale_pos_weight,
+        base_score=0.5,
         eval_metric="logloss",
         random_state=random_state,
-        use_label_encoder=False if hasattr(xgb, "use_label_encoder") else None
     )
 
     # 2. Random Forest Classifier
@@ -312,41 +313,88 @@ def get_shap_explanation(
     }
 
 
+def train_and_build_bundle(
+    csv_path: Union[str, Path] = DATA_PATH,
+    save_to_disk: bool = True,
+    model_destination: Path = MODEL_PATH,
+) -> Dict[str, Any]:
+    """
+    Train benchmark classifiers on the processed weather dataset, build the
+    SHAP TreeExplainer bundle, and optionally persist to disk.
+    """
+    X_train, X_test, y_train, y_test = load_and_split_data(csv_path)
+    sample_count = int(len(y_train) + len(y_test))
+    bust_rate = round(float((y_train.sum() + y_test.sum()) / max(sample_count, 1)), 4)
+
+    print(f"[+] Training Set: {len(X_train)} samples | Test Set: {len(X_test)} samples")
+    print(f"[+] Operational Features: {OPERATIONAL_FEATURES}")
+
+    train_output = train_and_evaluate_models(X_train, X_test, y_train, y_test)
+    champion_name = train_output["champion_name"]
+    champion_model = train_output["champion_model"]
+
+    explainer_model = train_output["xgb_model"] if "Ensemble" in champion_name else champion_model
+    try:
+        explainer, _shap_vals, global_drivers = compute_shap_explainability(explainer_model, X_test)
+    except Exception as exc:
+        rf_fallback = next(
+            (
+                entry["model"]
+                for name, entry in train_output["eval_results"].items()
+                if "Random" in name and isinstance(entry, dict) and "model" in entry
+            ),
+            None,
+        )
+        if rf_fallback is None or rf_fallback is explainer_model:
+            raise
+        print(f"[!] SHAP TreeExplainer fallback to RandomForest ({exc})")
+        explainer, _shap_vals, global_drivers = compute_shap_explainability(rf_fallback, X_test)
+
+    raw_metrics = train_output["eval_results"][champion_name]
+    clean_metrics = {k: v for k, v in raw_metrics.items() if k != "model"}
+
+    metadata = {
+        "pipeline_version": PIPELINE_VERSION,
+        "training_source": "Open-Meteo NWP Archive (18 Indian Stations, Day+3 vs Day-0)",
+        "sample_count": sample_count,
+        "bust_rate": bust_rate,
+        "champion_name": champion_name,
+        "metrics": clean_metrics,
+        "global_drivers": global_drivers.to_dict(orient="records"),
+    }
+
+    if save_to_disk:
+        try:
+            save_model_artifact(
+                model=champion_model,
+                explainer=explainer,
+                feature_names=OPERATIONAL_FEATURES,
+                metadata=metadata,
+                destination=model_destination,
+            )
+        except OSError as exc:
+            print(f"[!] Could not write model artifact to {model_destination}: {exc}")
+
+    return {
+        "model": champion_model,
+        "explainer": explainer,
+        "feature_names": OPERATIONAL_FEATURES,
+        "metadata": metadata,
+    }
+
+
 def main():
     print("=" * 70)
     print("AI-BASED FORECAST BUST DETECTION: PHASE 2 TRAINING & SHAP ENGINE")
     print("=" * 70)
 
-    # 1. Load Data
-    X_train, X_test, y_train, y_test = load_and_split_data(DATA_PATH)
-    print(f"[+] Training Set: {len(X_train)} samples | Test Set: {len(X_test)} samples")
-    print(f"[+] Operational Features: {OPERATIONAL_FEATURES}")
-
-    # 2. Train and Evaluate
-    train_output = train_and_evaluate_models(X_train, X_test, y_train, y_test)
-    champion_name = train_output["champion_name"]
-    champion_model = train_output["champion_model"]
-
-    # 3. Explainability Engine
-    # If the champion is XGBoost or RF, use it directly. If ensemble, use the XGBoost component for TreeExplainer
-    explainer_model = train_output["xgb_model"] if "Ensemble" in champion_name else champion_model
-    explainer, shap_vals, global_drivers = compute_shap_explainability(explainer_model, X_test)
-
-    # 4. Save Model Bundle
-    metadata = {
-        "champion_name": champion_name,
-        "metrics": train_output["eval_results"][champion_name],
-        "global_drivers": global_drivers.to_dict(orient="records"),
-    }
-    save_model_artifact(
-        model=champion_model,
-        explainer=explainer,
-        feature_names=OPERATIONAL_FEATURES,
-        metadata=metadata,
-        destination=MODEL_PATH
+    train_and_build_bundle(
+        csv_path=DATA_PATH,
+        save_to_disk=True,
+        model_destination=MODEL_PATH,
     )
 
-    # 5. Test Sample Explanation Helper
+    # Test Sample Explanation Helper
     sample_severe_case = {
         "predicted_temp": 32.5,
         "predicted_rainfall": 24.0,

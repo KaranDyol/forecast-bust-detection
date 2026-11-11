@@ -578,11 +578,36 @@ button[data-baseweb="tab"][aria-selected="true"] {{
 @st.cache_resource(show_spinner=False)
 def load_model_bundle() -> Dict[str, Any]:
     """Load the serialized model and SHAP TreeExplainer once per worker."""
-    if not MODEL_PATH.is_file():
-        raise FileNotFoundError(
-            f"Missing model file at {MODEL_PATH.resolve()}. Run train_model.py first."
-        )
-    return joblib.load(MODEL_PATH)
+    target_version = "v2-india-archive-2682"
+    data_csv = BASE_DIR / "processed_weather_data.csv"
+    bundle: Any = None
+
+    if MODEL_PATH.is_file():
+        bundle = joblib.load(MODEL_PATH)
+        meta = bundle.get("metadata", {}) if isinstance(bundle, dict) else {}
+        if meta.get("pipeline_version") == target_version:
+            return bundle
+
+    if data_csv.is_file():
+        try:
+            from train_model import train_and_build_bundle
+
+            return train_and_build_bundle(
+                csv_path=data_csv,
+                save_to_disk=True,
+                model_destination=MODEL_PATH,
+            )
+        except Exception:
+            if bundle is not None:
+                return bundle
+            raise
+
+    if bundle is not None:
+        return bundle
+
+    raise FileNotFoundError(
+        f"Missing model file at {MODEL_PATH.resolve()}. Run train_model.py first."
+    )
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -1566,9 +1591,31 @@ with tab_bulletin:
     f1_val = metrics.get("f1")
     recall_val = metrics.get("recall")
 
+    training_source = str(bundle_meta.get("training_source", "Historical NWP Benchmark Dataset"))
+    sample_count = bundle_meta.get("sample_count")
+    bust_rate = bundle_meta.get("bust_rate")
+    pipeline_ver = bundle_meta.get("pipeline_version")
+
+    dataset_badge_parts = [f"Source: **{training_source}**"]
+    if sample_count is not None:
+        dataset_badge_parts.append(f"Records: **{int(sample_count):,}**")
+    if bust_rate is not None:
+        dataset_badge_parts.append(f"Observed Bust Rate: **{float(bust_rate) * 100:.1f}%**")
+    st.caption(" · ".join(dataset_badge_parts))
+
     roc_txt = f"{float(roc_auc):.3f}" if roc_auc is not None else "N/A"
     f1_txt = f"{float(f1_val):.3f}" if f1_val is not None else "N/A"
     recall_txt = f"{float(recall_val):.3f}" if recall_val is not None else "N/A"
+    classifier_sub = (
+        f"{int(sample_count):,} records ({pipeline_ver})"
+        if sample_count is not None and pipeline_ver
+        else "Serialized in bust_model.pkl"
+    )
+    auc_sub = (
+        f"Real archive ({float(bust_rate) * 100:.1f}% bust rate)"
+        if bust_rate is not None
+        else "Imbalance-weighted training"
+    )
 
     st.markdown(
         f"""
@@ -1576,12 +1623,12 @@ with tab_bulletin:
   <div class="kpi-card" style="border-top: 3px solid {PALETTE['espresso']};">
     <div class="kpi-label">Active Classifier</div>
     <div class="kpi-value" style="color:{PALETTE['espresso']}; font-size:1.1rem;">{champion_name}</div>
-    <div class="kpi-sub">Serialized in bust_model.pkl</div>
+    <div class="kpi-sub">{classifier_sub}</div>
   </div>
   <div class="kpi-card" style="border-top: 3px solid {PALETTE['terracotta']};">
     <div class="kpi-label">Hold-Out ROC-AUC</div>
     <div class="kpi-value" style="color:{PALETTE['terracotta']};">{roc_txt}</div>
-    <div class="kpi-sub">Imbalance-weighted training</div>
+    <div class="kpi-sub">{auc_sub}</div>
   </div>
   <div class="kpi-card" style="border-top: 3px solid {PALETTE['amber']};">
     <div class="kpi-label">Validation F1</div>

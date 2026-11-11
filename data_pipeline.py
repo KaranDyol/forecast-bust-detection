@@ -14,10 +14,120 @@ This module is responsible for:
 4. Exporting a clean dataset ('processed_weather_data.csv') ready for ML training & SHAP explainability.
 """
 
+import math
+import time
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 import numpy as np
 import pandas as pd
+import requests
+
+INDIA_ARCHIVE_STATIONS: List[Tuple[str, float, float]] = [
+    ("New Delhi (Safdarjung)", 28.5847, 77.2066),
+    ("Mumbai (Santacruz)", 19.0760, 72.8777),
+    ("Kolkata (Alipore)", 22.5726, 88.3639),
+    ("Chennai (Meenambakkam)", 13.0827, 80.2707),
+    ("Bengaluru (HAL)", 12.9716, 77.5946),
+    ("Hyderabad (Begumpet)", 17.3850, 78.4867),
+    ("Bhubaneswar (Airport)", 20.2961, 85.8245),
+    ("Srinagar (Rambagh)", 34.0837, 74.7973),
+    ("Guwahati (Borjhar)", 26.1445, 91.7362),
+    ("Ahmedabad (Airport)", 23.0225, 72.5714),
+    ("Jaipur (Sanganer)", 26.9124, 75.7873),
+    ("Nagpur (Sonegaon)", 21.1458, 79.0882),
+    ("Visakhapatnam (CWC)", 17.6868, 83.2185),
+    ("Kochi (CIAL)", 9.9312, 76.2673),
+    ("Patna (Aerodrome)", 25.5941, 85.1376),
+    ("Bhopal (Bairagarh)", 23.2599, 77.4126),
+    ("Pune (Shivajinagar)", 18.5204, 73.8567),
+    ("Dehradun (FRI)", 30.3165, 78.0322),
+]
+
+PREVIOUS_RUNS_URL = "https://previous-runs-api.open-meteo.com/v1/forecast"
+ARCHIVE_HOURLY_VARS = (
+    "temperature_2m,temperature_2m_previous_day3,"
+    "precipitation,precipitation_previous_day3,"
+    "pressure_msl_previous_day3,"
+    "wind_speed_10m_previous_day3,wind_direction_10m_previous_day3,"
+    "wind_speed_500hPa,wind_direction_500hPa"
+)
+
+
+def _vector_wind_shear(w1: float, d1: float, w2: float, d2: float) -> float:
+    """Compute vector magnitude difference (m/s) between two wind levels."""
+    u1, v1 = -w1 * math.sin(math.radians(d1)), -w1 * math.cos(math.radians(d1))
+    u2, v2 = -w2 * math.sin(math.radians(d2)), -w2 * math.cos(math.radians(d2))
+    return math.hypot(u2 - u1, v2 - v1)
+
+
+def fetch_open_meteo_archive_data(past_days: int = 150) -> pd.DataFrame:
+    """
+    Fetch real paired historical NWP forecasts (Day+3 run vs Day-0 verification)
+    across 18 Indian synoptic stations via Open-Meteo's Previous Model Runs API.
+    """
+    records = []
+    for chunk_start in range(0, len(INDIA_ARCHIVE_STATIONS), 6):
+        batch = INDIA_ARCHIVE_STATIONS[chunk_start : chunk_start + 6]
+        params = {
+            "latitude": ",".join(f"{s[1]:.4f}" for s in batch),
+            "longitude": ",".join(f"{s[2]:.4f}" for s in batch),
+            "hourly": ARCHIVE_HOURLY_VARS,
+            "past_days": past_days,
+            "forecast_days": 0,
+            "wind_speed_unit": "ms",
+            "timezone": "Asia/Kolkata",
+        }
+        resp = requests.get(PREVIOUS_RUNS_URL, params=params, timeout=45)
+        resp.raise_for_status()
+        payload = resp.json()
+        if isinstance(payload, dict):
+            payload = [payload]
+
+        for _station, loc in zip(batch, payload):
+            hourly = loc.get("hourly", {})
+            n_hours = len(hourly.get("time", []))
+            n_days = n_hours // 24
+            for day_idx in range(1, n_days):
+                s = day_idx * 24
+                e = (day_idx + 1) * 24
+                t_obs = [float(x) for x in hourly["temperature_2m"][s:e] if x is not None]
+                t_pre = [float(x) for x in hourly["temperature_2m_previous_day3"][s:e] if x is not None]
+                r_obs = [float(x) for x in hourly["precipitation"][s:e] if x is not None]
+                r_pre = [float(x) for x in hourly["precipitation_previous_day3"][s:e] if x is not None]
+                p_arr = hourly["pressure_msl_previous_day3"]
+                pdrops = [
+                    float(p_arr[idx - 24]) - float(p_arr[idx])
+                    for idx in range(s, e)
+                    if p_arr[idx - 24] is not None and p_arr[idx] is not None
+                ]
+                sh_list = [
+                    _vector_wind_shear(
+                        float(hourly["wind_speed_10m_previous_day3"][idx]),
+                        float(hourly["wind_direction_10m_previous_day3"][idx]),
+                        float(hourly["wind_speed_500hPa"][idx]),
+                        float(hourly["wind_direction_500hPa"][idx]),
+                    )
+                    for idx in range(s, e)
+                    if None not in (
+                        hourly["wind_speed_10m_previous_day3"][idx],
+                        hourly["wind_direction_10m_previous_day3"][idx],
+                        hourly["wind_speed_500hPa"][idx],
+                        hourly["wind_direction_500hPa"][idx],
+                    )
+                ]
+                if not (t_obs and t_pre and r_obs and r_pre):
+                    continue
+                records.append({
+                    "predicted_temp": round(max(t_pre), 2),
+                    "actual_temp": round(max(t_obs), 2),
+                    "predicted_rainfall": round(sum(r_pre), 2),
+                    "actual_rainfall": round(sum(r_obs), 2),
+                    "wind_shear": round(float(np.percentile(sh_list, 85)) if sh_list else 12.0, 2),
+                    "pressure_drop": round(max([0.5] + pdrops), 2),
+                })
+        time.sleep(0.5)
+
+    return pd.DataFrame(records)
 
 
 def generate_synthetic_weather_data(
@@ -186,7 +296,8 @@ def run_pipeline(
     n_synthetic_samples: int = 5000,
     random_state: int = 42,
     temp_threshold: float = 3.0,
-    rainfall_threshold: float = 15.0
+    rainfall_threshold: float = 15.0,
+    use_open_meteo_archive: bool = True,
 ) -> pd.DataFrame:
     """
     End-to-end execution of Phase 1 Data Pipeline:
@@ -204,6 +315,15 @@ def run_pipeline(
     if dataset_path and Path(dataset_path).exists():
         print(f"[+] Loading Kaggle Rattle dataset from: {dataset_path}")
         df_raw = load_rattle_weather_dataset(dataset_path)
+    elif use_open_meteo_archive:
+        try:
+            print("[+] Fetching real paired NWP archive (Day+3 vs Day-0) from Open-Meteo...")
+            df_raw = fetch_open_meteo_archive_data(past_days=150)
+            if df_raw.empty:
+                raise ValueError("Open-Meteo archive returned 0 rows.")
+        except Exception as exc:
+            print(f"[!] Open-Meteo archive fetch failed ({exc}); falling back to synthetic generation.")
+            df_raw = generate_synthetic_weather_data(n_samples=n_synthetic_samples, random_state=random_state)
     else:
         if dataset_path:
             print(f"[!] Warning: Specified path '{dataset_path}' not found. Falling back to synthetic generation.")
