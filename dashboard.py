@@ -42,6 +42,33 @@ st.markdown(
 <style>
 @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
 
+@keyframes fadeSlideUp {{
+    from {{
+        opacity: 0;
+        transform: translateY(10px);
+    }}
+    to {{
+        opacity: 1;
+        transform: translateY(0);
+    }}
+}}
+
+@keyframes pulseRing {{
+    0% {{
+        box-shadow: 0 0 0 0 rgba(194, 59, 22, 0.55);
+    }}
+    70% {{
+        box-shadow: 0 0 0 8px rgba(194, 59, 22, 0);
+    }}
+    100% {{
+        box-shadow: 0 0 0 0 rgba(194, 59, 22, 0);
+    }}
+}}
+
+@keyframes barGrow {{
+    from {{ width: 0%; }}
+}}
+
 html, body, [class*="css"] {{
     font-family: 'DM Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     color: {PALETTE['espresso']};
@@ -52,14 +79,17 @@ html, body, [class*="css"] {{
 }}
 
 .block-container {{
-    padding-top: 2rem;
-    padding-bottom: 2.5rem;
-    max-width: 1240px;
+    padding: clamp(1.1rem, 2.5vw, 2rem) clamp(0.9rem, 3vw, 2.2rem) 2.5rem;
+    max-width: 1260px;
+}}
+
+.header-wrap {{
+    animation: fadeSlideUp 0.4s cubic-bezier(0.22, 1, 0.36, 1) both;
 }}
 
 .eyebrow-tag {{
     display: inline-block;
-    background-color: {PALETTE['amber']}40;
+    background-color: {PALETTE['amber']}3D;
     color: {PALETTE['espresso']};
     border: 1px solid {PALETTE['amber']};
     font-family: 'IBM Plex Mono', monospace;
@@ -73,7 +103,7 @@ html, body, [class*="css"] {{
 }}
 
 .page-title {{
-    font-size: 32px;
+    font-size: clamp(1.55rem, 2.8vw, 2.1rem);
     font-weight: 700;
     letter-spacing: -0.025em;
     color: {PALETTE['espresso']};
@@ -82,9 +112,19 @@ html, body, [class*="css"] {{
 }}
 
 .page-subtitle {{
-    font-size: 15px;
+    font-size: clamp(0.88rem, 1.3vw, 0.96rem);
     color: {PALETTE['muted_brown']};
-    margin: 0 0 22px 0;
+    margin: 0 0 14px 0;
+    line-height: 1.45;
+}}
+
+.header-rule {{
+    height: 2px;
+    width: 100%;
+    background: linear-gradient(90deg, {PALETTE['espresso']} 0%, {PALETTE['terracotta']} 45%, {PALETTE['amber']} 80%, transparent 100%);
+    border-radius: 2px;
+    margin-bottom: 20px;
+    opacity: 0.75;
 }}
 
 .sidebar-brand {{
@@ -94,6 +134,11 @@ html, body, [class*="css"] {{
     border-radius: 8px;
     border-bottom: 3px solid {PALETTE['amber']};
     margin-bottom: 18px;
+    transition: transform 0.2s ease;
+}}
+
+.sidebar-brand:hover {{
+    transform: translateY(-1px);
 }}
 
 .sidebar-brand-kicker {{
@@ -112,18 +157,41 @@ html, body, [class*="css"] {{
     margin: 0;
 }}
 
+/* Responsive 4 -> 2 -> 1 KPI grid */
+.kpi-grid {{
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 14px;
+    margin-bottom: 14px;
+}}
+
 .kpi-card {{
     background-color: {PALETTE['surface']};
     border: 1px solid {PALETTE['border']};
-    border-radius: 8px;
+    border-radius: 10px;
     padding: 14px 16px;
-    margin-bottom: 12px;
+    transition: transform 0.22s ease, box-shadow 0.22s ease, border-color 0.22s ease;
+    animation: fadeSlideUp 0.42s cubic-bezier(0.22, 1, 0.36, 1) both;
+}}
+
+.kpi-card:nth-child(1) {{ animation-delay: 0.03s; }}
+.kpi-card:nth-child(2) {{ animation-delay: 0.08s; }}
+.kpi-card:nth-child(3) {{ animation-delay: 0.13s; }}
+.kpi-card:nth-child(4) {{ animation-delay: 0.18s; }}
+
+.kpi-card:hover {{
+    transform: translateY(-3px);
+    box-shadow: 0 10px 22px -8px rgba(42, 26, 14, 0.14);
+    border-color: {PALETTE['amber']};
 }}
 
 .kpi-label {{
+    display: flex;
+    align-items: center;
+    gap: 7px;
     font-size: 11px;
     font-weight: 600;
-    letter-spacing: 0.06em;
+    letter-spacing: 0.055em;
     text-transform: uppercase;
     color: {PALETTE['muted_brown']};
     margin-bottom: 6px;
@@ -131,7 +199,7 @@ html, body, [class*="css"] {{
 
 .kpi-value {{
     font-family: 'IBM Plex Mono', monospace;
-    font-size: 24px;
+    font-size: clamp(1.2rem, 2vw, 1.52rem);
     font-weight: 600;
     font-variant-numeric: tabular-nums;
     line-height: 1.2;
@@ -140,16 +208,30 @@ html, body, [class*="css"] {{
 .kpi-sub {{
     font-size: 12px;
     color: {PALETTE['muted_brown']};
-    margin-top: 4px;
+    margin-top: 5px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}}
+
+.pulse-dot {{
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background-color: {PALETTE['critical_red']};
+    display: inline-block;
+    animation: pulseRing 1.9s infinite;
+    flex-shrink: 0;
 }}
 
 .status-banner {{
-    border-radius: 8px;
+    border-radius: 10px;
     padding: 12px 16px;
-    margin: 6px 0 20px 0;
+    margin: 4px 0 20px 0;
     font-size: 14px;
-    line-height: 1.45;
+    line-height: 1.48;
     color: {PALETTE['espresso']};
+    animation: fadeSlideUp 0.46s cubic-bezier(0.22, 1, 0.36, 1) 0.14s both;
 }}
 
 .banner-crit {{
@@ -173,7 +255,7 @@ html, body, [class*="css"] {{
 .map-legend {{
     display: flex;
     flex-wrap: wrap;
-    gap: 18px;
+    gap: 10px 18px;
     font-size: 13px;
     color: {PALETTE['muted_brown']};
     margin-bottom: 10px;
@@ -190,14 +272,37 @@ html, body, [class*="css"] {{
     height: 10px;
     border-radius: 50%;
     display: inline-block;
+    flex-shrink: 0;
+}}
+
+iframe {{
+    border-radius: 10px !important;
+    border: 1px solid {PALETTE['border']} !important;
+    box-shadow: 0 6px 18px -8px rgba(42, 26, 14, 0.12);
 }}
 
 .station-panel {{
     background-color: {PALETTE['surface']};
     border: 1px solid {PALETTE['border']};
-    border-radius: 8px;
+    border-radius: 10px;
     padding: 16px 18px;
     margin-bottom: 12px;
+    animation: fadeSlideUp 0.42s cubic-bezier(0.22, 1, 0.36, 1) both;
+}}
+
+.risk-meter-track {{
+    width: 100%;
+    height: 6px;
+    background-color: {PALETTE['sand']};
+    border-radius: 99px;
+    overflow: hidden;
+    margin: 10px 0 6px 0;
+}}
+
+.risk-meter-fill {{
+    height: 100%;
+    border-radius: 99px;
+    animation: barGrow 0.6s cubic-bezier(0.22, 1, 0.36, 1) both;
 }}
 
 .stat-grid {{
@@ -210,8 +315,14 @@ html, body, [class*="css"] {{
 .stat-cell {{
     background-color: {PALETTE['cream']};
     border: 1px solid {PALETTE['border']};
-    border-radius: 6px;
+    border-radius: 8px;
     padding: 10px 12px;
+    transition: border-color 0.2s ease, transform 0.2s ease;
+}}
+
+.stat-cell:hover {{
+    border-color: {PALETTE['amber']};
+    transform: translateY(-1px);
 }}
 
 .stat-cell-label {{
@@ -223,19 +334,38 @@ html, body, [class*="css"] {{
 
 .stat-cell-val {{
     font-family: 'IBM Plex Mono', monospace;
-    font-size: 16px;
+    font-size: 15.5px;
     font-weight: 600;
     color: {PALETTE['espresso']};
     margin-top: 2px;
 }}
 
+/* Responsive 3 -> 2 -> 1 Driver cards grid */
+.driver-grid {{
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 14px;
+    margin-top: 10px;
+    margin-bottom: 14px;
+}}
+
 .driver-card {{
     background-color: {PALETTE['surface']};
     border: 1px solid {PALETTE['border']};
-    border-radius: 8px;
+    border-radius: 10px;
     padding: 14px 16px;
-    height: 100%;
-    margin-bottom: 10px;
+    transition: transform 0.22s ease, box-shadow 0.22s ease, border-color 0.22s ease;
+    animation: fadeSlideUp 0.45s cubic-bezier(0.22, 1, 0.36, 1) both;
+}}
+
+.driver-card:nth-child(1) {{ animation-delay: 0.06s; }}
+.driver-card:nth-child(2) {{ animation-delay: 0.12s; }}
+.driver-card:nth-child(3) {{ animation-delay: 0.18s; }}
+
+.driver-card:hover {{
+    transform: translateY(-3px);
+    box-shadow: 0 10px 22px -8px rgba(42, 26, 14, 0.14);
+    border-color: {PALETTE['amber']};
 }}
 
 .driver-pill {{
@@ -251,14 +381,48 @@ html, body, [class*="css"] {{
 
 .mono-meta {{
     font-family: 'IBM Plex Mono', monospace;
-    font-size: 12.5px;
+    font-size: 12px;
     color: {PALETTE['muted_brown']};
 }}
 
-@media (max-width: 768px) {{
-    .page-title {{ font-size: 24px; }}
-    .kpi-value {{ font-size: 20px; }}
-    .stat-grid {{ grid-template-columns: 1fr; }}
+/* Tablet breakpoint */
+@media (max-width: 1024px) {{
+    .kpi-grid {{
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }}
+    .driver-grid {{
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }}
+}}
+
+/* Mobile breakpoint */
+@media (max-width: 640px) {{
+    .kpi-grid {{
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 10px;
+    }}
+    .kpi-card {{
+        padding: 12px;
+    }}
+    .driver-grid {{
+        grid-template-columns: 1fr;
+    }}
+}}
+
+/* Very small phones */
+@media (max-width: 400px) {{
+    .kpi-grid, .stat-grid {{
+        grid-template-columns: 1fr;
+    }}
+}}
+
+/* Respect OS accessibility setting */
+@media (prefers-reduced-motion: reduce) {{
+    *, *::before, *::after {{
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+    }}
 }}
 </style>
 """,
@@ -510,10 +674,15 @@ with st.sidebar:
 
 
 # Header
-st.markdown('<div class="eyebrow-tag">Medium-Range NWP Screening</div>', unsafe_allow_html=True)
-st.markdown('<h1 class="page-title">Forecast Bust Early Warning</h1>', unsafe_allow_html=True)
 st.markdown(
-    '<p class="page-subtitle">Pre-dissemination failure screening (&gt;3°C temp or &gt;15mm rain error) across 18 synoptic stations, with SHAP attribution.</p>',
+    """
+<div class="header-wrap">
+  <div class="eyebrow-tag">Medium-Range NWP Screening</div>
+  <h1 class="page-title">Forecast Bust Early Warning</h1>
+  <p class="page-subtitle">Pre-dissemination failure screening (&gt;3°C temp or &gt;15mm rain error) across 18 synoptic stations, with SHAP attribution.</p>
+  <div class="header-rule"></div>
+</div>
+""",
     unsafe_allow_html=True,
 )
 
@@ -531,58 +700,38 @@ mean_risk = float(df_stations["risk_percentage"].mean())
 top_pos = int(np.argmax(df_stations["risk_percentage"].values))
 top_station = df_stations.iloc[top_pos]
 
-# KPI Strip
-k1, k2, k3, k4 = st.columns(4)
+# Responsive CSS Grid KPI Strip (4 cols desktop -> 2x2 tablet/mobile -> 1 col micro)
+crit_color = PALETTE["critical_red"] if high_risk_count > 0 else PALETTE["sage_green"]
+pulse_html = '<span class="pulse-dot"></span>' if high_risk_count > 0 else ""
+short_name = top_station["station_name"].split(" (")[0]
 
-with k1:
-    st.markdown(
-        f"""
-        <div class="kpi-card" style="border-top: 3px solid {PALETTE['espresso']};">
-            <div class="kpi-label">Synoptic Grid</div>
-            <div class="kpi-value" style="color:{PALETTE['espresso']};">{len(df_stations)} Stations</div>
-            <div class="kpi-sub">Mean bust risk: {mean_risk:.1f}%</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-with k2:
-    crit_color = PALETTE["critical_red"] if high_risk_count > 0 else PALETTE["sage_green"]
-    st.markdown(
-        f"""
-        <div class="kpi-card" style="border-top: 3px solid {crit_color};">
-            <div class="kpi-label">High-Risk Bust Zones (&ge;{alert_threshold}%)</div>
-            <div class="kpi-value" style="color:{crit_color};">{high_risk_count} Active</div>
-            <div class="kpi-sub">Requires forecaster review</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-with k3:
-    st.markdown(
-        f"""
-        <div class="kpi-card" style="border-top: 3px solid {PALETTE['amber']};">
-            <div class="kpi-label">Elevated Watch (50&ndash;{alert_threshold}%)</div>
-            <div class="kpi-value" style="color:{PALETTE['terracotta']};">{elevated_count} Stations</div>
-            <div class="kpi-sub">Monitor convective shifts</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-with k4:
-    short_name = top_station["station_name"].split(" (")[0]
-    st.markdown(
-        f"""
-        <div class="kpi-card" style="border-top: 3px solid {PALETTE['terracotta']};">
-            <div class="kpi-label">Peak Vulnerability</div>
-            <div class="kpi-value" style="color:{PALETTE['critical_red']};">{top_station['risk_percentage']:.1f}%</div>
-            <div class="kpi-sub">{short_name} &middot; {top_station['zone']}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+st.markdown(
+    f"""
+<div class="kpi-grid">
+  <div class="kpi-card" style="border-top: 3px solid {PALETTE['espresso']};">
+    <div class="kpi-label">Synoptic Grid</div>
+    <div class="kpi-value" style="color:{PALETTE['espresso']};">{len(df_stations)} Stations</div>
+    <div class="kpi-sub">Mean bust risk: {mean_risk:.1f}%</div>
+  </div>
+  <div class="kpi-card" style="border-top: 3px solid {crit_color};">
+    <div class="kpi-label">{pulse_html}High-Risk Bust Zones (&ge;{alert_threshold}%)</div>
+    <div class="kpi-value" style="color:{crit_color};">{high_risk_count} Active</div>
+    <div class="kpi-sub">Requires forecaster review</div>
+  </div>
+  <div class="kpi-card" style="border-top: 3px solid {PALETTE['amber']};">
+    <div class="kpi-label">Elevated Watch (50&ndash;{alert_threshold}%)</div>
+    <div class="kpi-value" style="color:{PALETTE['terracotta']};">{elevated_count} Stations</div>
+    <div class="kpi-sub">Monitor convective shifts</div>
+  </div>
+  <div class="kpi-card" style="border-top: 3px solid {PALETTE['terracotta']};">
+    <div class="kpi-label">Peak Vulnerability</div>
+    <div class="kpi-value" style="color:{PALETTE['critical_red']};">{top_station['risk_percentage']:.1f}%</div>
+    <div class="kpi-sub">{short_name} &middot; {top_station['zone']}</div>
+  </div>
+</div>
+""",
+    unsafe_allow_html=True,
+)
 
 if high_risk_count > 0:
     st.markdown(
@@ -671,6 +820,18 @@ for _, row in df_stations.iterrows():
     </div>
     """
 
+    if risk >= alert_threshold:
+        folium.CircleMarker(
+            location=[row["lat"], row["lon"]],
+            radius=17,
+            color=PALETTE["critical_red"],
+            fill=True,
+            fill_color=PALETTE["critical_red"],
+            fill_opacity=0.18,
+            weight=1,
+            interactive=False,
+        ).add_to(india_map)
+
     folium.CircleMarker(
         location=[row["lat"], row["lon"]],
         radius=radius,
@@ -733,38 +894,41 @@ with col_info:
 
     st.markdown(
         f"""
-        <div class="station-panel">
-            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
-                <div style="font-size:18px; font-weight:700; color:{PALETTE['espresso']};">{sel['station_name']}</div>
-                <span style="background:{badge_bg}; color:#FFF9F0; font-family:'IBM Plex Mono', monospace; font-size:11px; font-weight:600; padding:3px 9px; border-radius:4px;">{verdict}</span>
-            </div>
-            <div class="mono-meta" style="margin-top:6px;">
-                {sel['state']} &middot; {sel['zone']} &middot; {sel['lat']:.2f}°N, {sel['lon']:.2f}°E
-            </div>
-            <p style="font-size:13.5px; color:{PALETTE['espresso']}; margin:10px 0 4px 0;">{advice}</p>
-            <div class="stat-grid">
-                <div class="stat-cell">
-                    <div class="stat-cell-label">Forecast Temp</div>
-                    <div class="stat-cell-val">{sel['predicted_temp']} °C</div>
-                </div>
-                <div class="stat-cell">
-                    <div class="stat-cell-label">Forecast Rain (24h)</div>
-                    <div class="stat-cell-val">{sel['predicted_rainfall']} mm</div>
-                </div>
-                <div class="stat-cell">
-                    <div class="stat-cell-label">Wind Shear (0-6km)</div>
-                    <div class="stat-cell-val">{sel['wind_shear']} m/s</div>
-                </div>
-                <div class="stat-cell">
-                    <div class="stat-cell-label">Pressure Drop (24h)</div>
-                    <div class="stat-cell-val">-{sel['pressure_drop']} hPa</div>
-                </div>
-            </div>
-            <div class="mono-meta" style="margin-top:10px; font-size:11px;">
-                Horizon: Day +{lead_day} ({lead_day * 24}h) &middot; Attribution via {shap_result['source']}
-            </div>
-        </div>
-        """,
+<div class="station-panel">
+<div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+<div style="font-size:18px; font-weight:700; color:{PALETTE['espresso']};">{sel['station_name']}</div>
+<span style="background:{badge_bg}; color:#FFF9F0; font-family:'IBM Plex Mono', monospace; font-size:11px; font-weight:600; padding:3px 9px; border-radius:4px;">{verdict}</span>
+</div>
+<div class="mono-meta" style="margin-top:6px;">
+{sel['state']} &middot; {sel['zone']} &middot; {sel['lat']:.2f}°N, {sel['lon']:.2f}°E
+</div>
+<div class="risk-meter-track" role="progressbar" aria-valuenow="{min(max(sel_risk, 0.0), 100.0):.1f}" aria-valuemin="0" aria-valuemax="100">
+<div class="risk-meter-fill" style="width: {min(max(sel_risk, 0.0), 100.0):.1f}%; background: {badge_bg};"></div>
+</div>
+<p style="font-size:13.5px; color:{PALETTE['espresso']}; margin:10px 0 4px 0;">{advice}</p>
+<div class="stat-grid">
+<div class="stat-cell">
+<div class="stat-cell-label">Forecast Temp</div>
+<div class="stat-cell-val">{sel['predicted_temp']} °C</div>
+</div>
+<div class="stat-cell">
+<div class="stat-cell-label">Forecast Rain (24h)</div>
+<div class="stat-cell-val">{sel['predicted_rainfall']} mm</div>
+</div>
+<div class="stat-cell">
+<div class="stat-cell-label">Wind Shear (0-6km)</div>
+<div class="stat-cell-val">{sel['wind_shear']} m/s</div>
+</div>
+<div class="stat-cell">
+<div class="stat-cell-label">Pressure Drop (24h)</div>
+<div class="stat-cell-val">-{sel['pressure_drop']} hPa</div>
+</div>
+</div>
+<div class="mono-meta" style="margin-top:10px; font-size:11px;">
+Horizon: Day +{lead_day} ({lead_day * 24}h) &middot; Attribution via {shap_result['source']}
+</div>
+</div>
+""",
         unsafe_allow_html=True,
     )
 
@@ -818,36 +982,32 @@ with col_chart:
         plot_bgcolor=PALETTE["cream"],
         margin=dict(l=12, r=36, t=46, b=36),
         height=315,
+        transition=dict(duration=380, easing="cubic-in-out"),
     )
 
-    st.plotly_chart(fig, width="stretch")
+    st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
 
 # Driver Breakdown Cards
-driver_cols = st.columns(len(factors))
-for col, factor in zip(driver_cols, factors):
+driver_cards_html: List[str] = []
+for factor in factors:
     pushes_risk = factor["impact"] == "increases_bust_risk"
     accent = PALETTE["terracotta"] if pushes_risk else PALETTE["sage_green"]
     pill_bg = f"{PALETTE['terracotta']}1F" if pushes_risk else f"{PALETTE['sage_green']}1F"
     pill_label = "Raises Bust Risk" if pushes_risk else "Stabilizes Forecast"
+    feat_title = factor["feature"].replace("_", " ").title()
+    driver_cards_html.append(
+        f'<div class="driver-card" style="border-left: 4px solid {accent};">'
+        f'<span class="driver-pill" style="background:{pill_bg}; color:{accent};">{pill_label}</span>'
+        f'<div style="font-size:16px; font-weight:700; color:{PALETTE["espresso"]}; margin:8px 0 4px 0;">{feat_title}</div>'
+        f'<div class="mono-meta">Input: <strong>{factor["feature_value"]}</strong> &middot; SHAP: <strong>{factor["shap_value"]:+.4f}</strong></div>'
+        f'<p style="font-size:13px; color:{PALETTE["muted_brown"]}; margin:8px 0 0 0; line-height:1.45;">{factor["description"]}</p>'
+        f"</div>"
+    )
 
-    with col:
-        st.markdown(
-            f"""
-            <div class="driver-card" style="border-left: 4px solid {accent};">
-                <span class="driver-pill" style="background:{pill_bg}; color:{accent};">{pill_label}</span>
-                <div style="font-size:16px; font-weight:700; color:{PALETTE['espresso']}; margin:8px 0 4px 0;">
-                    {factor['feature'].replace('_', ' ').title()}
-                </div>
-                <div class="mono-meta">
-                    Input: <strong>{factor['feature_value']}</strong> &middot; SHAP: <strong>{factor['shap_value']:+.4f}</strong>
-                </div>
-                <p style="font-size:13px; color:{PALETTE['muted_brown']}; margin:8px 0 0 0; line-height:1.45;">
-                    {factor['description']}
-                </p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+st.markdown(
+    f'<div class="driver-grid">{"".join(driver_cards_html)}</div>',
+    unsafe_allow_html=True,
+)
 
 # Station Table
 with st.expander("View All 18 Synoptic Stations"):
