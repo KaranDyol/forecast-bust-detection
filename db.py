@@ -190,7 +190,7 @@ def get_engine(database_url: Optional[str] = None) -> Engine:
     if url.startswith("sqlite"):
         engine = create_engine(
             url,
-            connect_args={"check_same_thread": False},
+            connect_args={"check_same_thread": False, "timeout": 30},
             future=True,
         )
 
@@ -199,6 +199,7 @@ def get_engine(database_url: Optional[str] = None) -> Engine:
             cursor = dbapi_conn.cursor()
             cursor.execute("PRAGMA foreign_keys=ON;")
             cursor.execute("PRAGMA journal_mode=WAL;")
+            cursor.execute("PRAGMA busy_timeout=30000;")
             cursor.close()
     else:
         engine = create_engine(

@@ -630,7 +630,7 @@ def is_api_reachable() -> bool:
 
 
 @st.cache_resource(show_spinner=False)
-def ensure_db_initialized(schema_version: str = "v3-multihorizon-spread-10728") -> Optional[Dict[str, Any]]:
+def ensure_db_initialized(schema_version: str = "v3-multihorizon-spread-10728-r2") -> Optional[Dict[str, Any]]:
     """Initialize SQL tables, hydrate multi-horizon archive rows if needed, and register active model."""
     try:
         import importlib
@@ -639,6 +639,7 @@ def ensure_db_initialized(schema_version: str = "v3-multihorizon-spread-10728") 
 
         summary = bootstrap_database()
         data_csv = BASE_DIR / "processed_weather_data.csv"
+        hydrate_error: Optional[str] = None
         if summary.get("forecast_runs", 0) < 5000 and data_csv.is_file():
             try:
                 importlib.reload(data_pipeline)
@@ -646,8 +647,8 @@ def ensure_db_initialized(schema_version: str = "v3-multihorizon-spread-10728") 
                 if "station_name" in df_csv.columns and "valid_date" in df_csv.columns:
                     data_pipeline.persist_archive_df_to_db(df_csv)
                     summary = bootstrap_database()
-            except Exception:
-                pass
+            except Exception as exc:
+                hydrate_error = str(exc)
 
         bundle = load_model_bundle()
         meta = bundle.get("metadata", {}) if isinstance(bundle, dict) else {}
@@ -664,6 +665,8 @@ def ensure_db_initialized(schema_version: str = "v3-multihorizon-spread-10728") 
                 set_active=True,
             )
             summary = bootstrap_database()
+        if hydrate_error:
+            summary["hydration_error"] = hydrate_error
         return summary
     except Exception:
         return None
@@ -2124,5 +2127,7 @@ with tab_bulletin:
                     st.rerun()
                 except Exception as exc:
                     st.error(f"Archive sync failed: {exc}")
+        if isinstance(db_summary, dict) and db_summary.get("hydration_error"):
+            st.warning(f"Startup archive hydration note: {db_summary['hydration_error']}")
     else:
         st.info("Database engine initializing or unavailable in this environment.")

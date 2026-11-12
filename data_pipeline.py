@@ -213,7 +213,8 @@ def persist_archive_df_to_db(df_meta: pd.DataFrame) -> Dict[str, int]:
 
     records = df_meta.to_dict(orient="records")
     n_forecasts = upsert_forecast_snapshots(records, nwp_model="open_meteo_multihorizon")
-    n_verifs = upsert_verification_outcomes(records, source="open_meteo_day0")
+    verif_df = df_meta.drop_duplicates(subset=["station_name", "valid_date"])
+    n_verifs = upsert_verification_outcomes(verif_df.to_dict(orient="records"), source="open_meteo_day0")
     return {"forecast_runs": n_forecasts, "verification_outcomes": n_verifs}
 
 
