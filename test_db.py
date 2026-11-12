@@ -71,6 +71,11 @@ def test_database_roundtrip() -> None:
             engine=engine,
         )
 
+        pending_before = db.get_pending_verification_summary(engine=engine)
+        assert pending_before["pending_past_pairs"] == 2
+        assert pending_before["live_forward_runs"] == 2
+        assert pending_before["live_verified_pairs"] == 0
+
         db.upsert_verification_outcomes(
             [
                 {
@@ -123,6 +128,12 @@ def test_database_roundtrip() -> None:
         assert final_summary["verified_pairs"] == 2
         assert final_summary["prediction_logs"] == 1
         assert final_summary["model_runs"] == 1
+
+        pending_after = db.get_pending_verification_summary(engine=engine)
+        assert pending_after["pending_past_pairs"] == 0
+        assert pending_after["live_verified_pairs"] == 2
+        assert pending_after["min_verified_date"] == "2026-11-11"
+        assert pending_after["max_verified_date"] == "2026-11-11"
 
         engine.dispose()
 

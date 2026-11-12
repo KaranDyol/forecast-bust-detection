@@ -4,7 +4,7 @@ Medium-range weather forecast bust monitor and SHAP diagnostics dashboard.
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import math
 import os
 import joblib
@@ -37,6 +37,7 @@ def _resolve_api_base_url() -> str:
 
 API_BASE_URL = _resolve_api_base_url()
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
 
 NWP_MODELS: Dict[str, Dict[str, Any]] = {
     "ECMWF IFS (0.25°)": {"open_meteo_model": "ecmwf_ifs025", "sim_scale": 1.00},
@@ -568,6 +569,16 @@ button[data-baseweb="tab"][aria-selected="true"] {{
     transform: translateY(-1px);
 }}
 
+.btn-spacer {{
+    height: 28px;
+}}
+
+@media (max-width: 900px) {{
+    .btn-spacer {{
+        display: none;
+    }}
+}}
+
 /* Respect OS accessibility setting */
 @media (prefers-reduced-motion: reduce) {{
     *, *::before, *::after {{
@@ -807,6 +818,143 @@ def _blend_hourly_pair(arr_a: List[Any], arr_b: List[Any]) -> List[Any]:
     return out
 
 
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Compute great-circle surface distance in kilometers between two coordinates."""
+    r_earth = 6371.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    d_phi = math.radians(lat2 - lat1)
+    d_lam = math.radians(lon2 - lon1)
+    a = math.sin(d_phi / 2.0) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(d_lam / 2.0) ** 2
+    return 2.0 * r_earth * math.asin(min(1.0, math.sqrt(a)))
+
+
+def _find_nearest_station(lat: float, lon: float) -> Dict[str, Any]:
+    """Return the nearest canonical Indian synoptic station and surface distance (km)."""
+    best_st = INDIAN_MET_STATIONS[0]
+    best_dist = float("inf")
+    for st_info in INDIAN_MET_STATIONS:
+        dist = _haversine_km(lat, lon, float(st_info["lat"]), float(st_info["lon"]))
+        if dist < best_dist:
+            best_dist = dist
+            best_st = st_info
+    return {**best_st, "dist_km": round(best_dist, 1)}
+
+
+def _extract_location_horizon_rows(
+    station_meta: Dict[str, Any],
+    loc_data: Dict[str, Any],
+    om_model: str,
+) -> List[Dict[str, Any]]:
+    """Transform a single Open-Meteo multi-model hourly location payload into 10 daily feature rows."""
+    hourly = loc_data.get("hourly", {})
+    times = hourly.get("time", [])
+
+    ec_t_arr = _first_series(hourly, "temperature_2m_ecmwf_ifs025", "temperature_2m")
+    gf_t_arr = _first_series(hourly, "temperature_2m_gfs_seamless", "temperature_2m")
+    ec_r_arr = _first_series(hourly, "precipitation_ecmwf_ifs025", "precipitation")
+    gf_r_arr = _first_series(hourly, "precipitation_gfs_seamless", "precipitation")
+
+    if om_model == "gfs_seamless":
+        temps = gf_t_arr or ec_t_arr
+        rains = gf_r_arr or ec_r_arr
+        press = _first_series(hourly, "pressure_msl_gfs_seamless", "pressure_msl_ecmwf_ifs025", "pressure_msl")
+        w10_arr = _first_series(hourly, "wind_speed_10m_gfs_seamless", "wind_speed_10m_ecmwf_ifs025", "wind_speed_10m")
+        d10_arr = _first_series(hourly, "wind_direction_10m_gfs_seamless", "wind_direction_10m_ecmwf_ifs025", "wind_direction_10m")
+        w5_arr = _first_series(hourly, "wind_speed_500hPa_gfs_seamless", "wind_speed_500hPa_ecmwf_ifs025", "wind_speed_500hPa")
+        d5_arr = _first_series(hourly, "wind_direction_500hPa_gfs_seamless", "wind_direction_500hPa_ecmwf_ifs025", "wind_direction_500hPa")
+        rh_arr = _first_series(hourly, "relative_humidity_2m_gfs_seamless", "relative_humidity_2m_ecmwf_ifs025", "relative_humidity_2m")
+    elif om_model == "best_match":
+        temps = _blend_hourly_pair(ec_t_arr, gf_t_arr)
+        rains = _blend_hourly_pair(ec_r_arr, gf_r_arr)
+        press = _blend_hourly_pair(
+            _first_series(hourly, "pressure_msl_ecmwf_ifs025", "pressure_msl"),
+            _first_series(hourly, "pressure_msl_gfs_seamless", "pressure_msl"),
+        )
+        w10_arr = _first_series(hourly, "wind_speed_10m_ecmwf_ifs025", "wind_speed_10m_gfs_seamless", "wind_speed_10m")
+        d10_arr = _first_series(hourly, "wind_direction_10m_ecmwf_ifs025", "wind_direction_10m_gfs_seamless", "wind_direction_10m")
+        w5_arr = _first_series(hourly, "wind_speed_500hPa_ecmwf_ifs025", "wind_speed_500hPa_gfs_seamless", "wind_speed_500hPa")
+        d5_arr = _first_series(hourly, "wind_direction_500hPa_ecmwf_ifs025", "wind_direction_500hPa_gfs_seamless", "wind_direction_500hPa")
+        rh_arr = _blend_hourly_pair(
+            _first_series(hourly, "relative_humidity_2m_ecmwf_ifs025", "relative_humidity_2m"),
+            _first_series(hourly, "relative_humidity_2m_gfs_seamless", "relative_humidity_2m"),
+        )
+    else:
+        temps = ec_t_arr or gf_t_arr
+        rains = ec_r_arr or gf_r_arr
+        press = _first_series(hourly, "pressure_msl_ecmwf_ifs025", "pressure_msl_gfs_seamless", "pressure_msl")
+        w10_arr = _first_series(hourly, "wind_speed_10m_ecmwf_ifs025", "wind_speed_10m_gfs_seamless", "wind_speed_10m")
+        d10_arr = _first_series(hourly, "wind_direction_10m_ecmwf_ifs025", "wind_direction_10m_gfs_seamless", "wind_direction_10m")
+        w5_arr = _first_series(hourly, "wind_speed_500hPa_ecmwf_ifs025", "wind_speed_500hPa_gfs_seamless", "wind_speed_500hPa")
+        d5_arr = _first_series(hourly, "wind_direction_500hPa_ecmwf_ifs025", "wind_direction_500hPa_gfs_seamless", "wind_direction_500hPa")
+        rh_arr = _first_series(hourly, "relative_humidity_2m_ecmwf_ifs025", "relative_humidity_2m_gfs_seamless", "relative_humidity_2m")
+
+    # Keep GFS CAPE primary to stay distribution-aligned with Open-Meteo archive training data
+    cape_arr = _first_series(hourly, "cape_gfs_seamless", "cape_ecmwf_ifs025", "cape")
+    fallback_temp = float(station_meta.get("base_temp", 30.0))
+
+    rows: List[Dict[str, Any]] = []
+    for lead_day in range(1, 11):
+        start = lead_day * 24
+        end = (lead_day + 1) * 24
+        if len(times) < end:
+            raise RuntimeError("Incomplete Open-Meteo horizon array")
+
+        day_temps = [float(x) for x in temps[start:end] if x is not None]
+        day_rains = [float(x) for x in rains[start:end] if x is not None]
+        ec_t_day = [float(x) for x in ec_t_arr[start:end] if x is not None]
+        gf_t_day = [float(x) for x in gf_t_arr[start:end] if x is not None]
+        ec_r_day = [float(x) for x in ec_r_arr[start:end] if x is not None]
+        gf_r_day = [float(x) for x in gf_r_arr[start:end] if x is not None]
+        rh_day = [float(x) for x in rh_arr[start:end] if x is not None]
+        cape_day = [float(x) for x in cape_arr[start:end] if x is not None]
+
+        # Same-hour 24h pressure tendency removes the ~4 hPa tropical diurnal tide
+        drops_24h = [
+            float(press[idx - 24]) - float(press[idx])
+            for idx in range(start, end)
+            if idx < len(press) and press[idx - 24] is not None and press[idx] is not None
+        ]
+        shears = [
+            _vector_wind_shear(
+                float(w10_arr[idx]),
+                float(d10_arr[idx]),
+                float(w5_arr[idx]),
+                float(d5_arr[idx]),
+            )
+            for idx in range(start, end)
+            if idx < len(w10_arr) and idx < len(d10_arr) and idx < len(w5_arr) and idx < len(d5_arr)
+            and None not in (w10_arr[idx], d10_arr[idx], w5_arr[idx], d5_arr[idx])
+        ]
+
+        pred_temp = max(day_temps) if day_temps else fallback_temp
+        pred_rain = sum(day_rains) if day_rains else 0.0
+        p_drop = max([0.5] + drops_24h)
+        shear_85 = float(np.percentile(shears, 85)) if shears else 12.0
+        rh_mean = float(np.mean(rh_day)) if rh_day else 65.0
+        cape_max = max(cape_day) if cape_day else 0.0
+        t_spread = abs(max(ec_t_day) - max(gf_t_day)) if (ec_t_day and gf_t_day) else 0.8
+        r_spread = abs(sum(ec_r_day) - sum(gf_r_day)) if (ec_r_day and gf_r_day) else 1.0
+
+        rows.append({
+            "lead_day": lead_day,
+            "forecast_date": str(times[start])[:10],
+            "station_name": station_meta["name"],
+            "state": station_meta["state"],
+            "zone": station_meta["zone"],
+            "lat": float(station_meta["lat"]),
+            "lon": float(station_meta["lon"]),
+            "predicted_temp": round(pred_temp, 1),
+            "predicted_rainfall": round(max(0.0, pred_rain), 1),
+            "wind_shear": round(float(np.clip(shear_85, 4.0, 50.0)), 2),
+            "pressure_drop": round(float(np.clip(p_drop, 0.5, 30.0)), 2),
+            "relative_humidity": round(float(np.clip(rh_mean, 5.0, 100.0)), 1),
+            "cape": round(float(np.clip(cape_max, 0.0, 5000.0)), 0),
+            "model_temp_spread": round(t_spread, 2),
+            "model_rain_spread": round(r_spread, 2),
+        })
+    return rows
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def _fetch_open_meteo_grid() -> List[Dict[str, Any]]:
     """
@@ -840,6 +988,155 @@ def _fetch_open_meteo_grid() -> List[Dict[str, Any]]:
 
 
 @st.cache_data(ttl=900, show_spinner=False)
+def _fetch_open_meteo_point(lat_round: float, lon_round: float) -> Dict[str, Any]:
+    """Fetch an 11-day multi-model forecast series for any clicked coordinate or searched city."""
+    params = {
+        "latitude": lat_round,
+        "longitude": lon_round,
+        "hourly": (
+            "temperature_2m,precipitation,pressure_msl,"
+            "wind_speed_10m,wind_direction_10m,wind_speed_500hPa,wind_direction_500hPa,"
+            "relative_humidity_2m,cape"
+        ),
+        "wind_speed_unit": "ms",
+        "forecast_days": 11,
+        "timezone": "Asia/Kolkata",
+        "models": "ecmwf_ifs025,gfs_seamless",
+    }
+    resp = requests.get(OPEN_METEO_URL, params=params, timeout=12.0)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Open-Meteo returned HTTP {resp.status_code}")
+    payload = resp.json()
+    if isinstance(payload, list):
+        payload = payload[0]
+    if not isinstance(payload, dict) or "hourly" not in payload:
+        raise RuntimeError("Unexpected single-point Open-Meteo response")
+    return payload
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def geocode_city_candidates(query: str) -> List[Dict[str, Any]]:
+    """Resolve city/town names into coordinates via Open-Meteo Geocoding API (prioritizing India)."""
+    clean_q = query.strip()
+    if not clean_q:
+        return []
+    resp = requests.get(
+        GEOCODING_URL,
+        params={"name": clean_q, "count": 6, "language": "en", "format": "json"},
+        timeout=8.0,
+    )
+    if resp.status_code != 200:
+        return []
+    results = resp.json().get("results") or []
+    candidates: List[Dict[str, Any]] = []
+    for item in results:
+        name = str(item.get("name", clean_q))
+        admin1 = str(item.get("admin1") or "").strip()
+        country = str(item.get("country") or "").strip()
+        parts = [p for p in [name, admin1, country] if p]
+        candidates.append({
+            "name": name,
+            "admin1": admin1,
+            "country": country,
+            "country_code": str(item.get("country_code") or "").upper(),
+            "label": ", ".join(parts),
+            "lat": round(float(item["latitude"]), 4),
+            "lon": round(float(item["longitude"]), 4),
+            "elevation": item.get("elevation"),
+        })
+    candidates.sort(key=lambda c: 0 if c["country_code"] == "IN" else 1)
+    return candidates
+
+
+def _build_idw_point_horizon_df(
+    lat: float,
+    lon: float,
+    label: str,
+    state: str,
+    zone: str,
+    grid_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Spatially interpolate 18 synoptic station forecasts onto an arbitrary coordinate via IDW."""
+    feature_cols = [
+        "predicted_temp",
+        "predicted_rainfall",
+        "wind_shear",
+        "pressure_drop",
+        "relative_humidity",
+        "cape",
+        "model_temp_spread",
+        "model_rain_spread",
+    ]
+    rows: List[Dict[str, Any]] = []
+    for ld in range(1, 11):
+        sub = grid_df[grid_df["lead_day"] == ld]
+        if sub.empty:
+            continue
+        dists = np.array([
+            _haversine_km(lat, lon, float(r.lat), float(r.lon))
+            for r in sub.itertuples()
+        ])
+        weights = 1.0 / (dists ** 2 + 900.0)
+        weights /= weights.sum()
+        blended = {col: float(np.dot(weights, sub[col].astype(float).values)) for col in feature_cols}
+        rows.append({
+            "lead_day": ld,
+            "forecast_date": str(sub["forecast_date"].iloc[0]),
+            "station_name": label,
+            "state": state,
+            "zone": zone,
+            "lat": lat,
+            "lon": lon,
+            "predicted_temp": round(blended["predicted_temp"], 1),
+            "predicted_rainfall": round(max(0.0, blended["predicted_rainfall"]), 1),
+            "wind_shear": round(float(np.clip(blended["wind_shear"], 4.0, 50.0)), 2),
+            "pressure_drop": round(float(np.clip(blended["pressure_drop"], 0.5, 30.0)), 2),
+            "relative_humidity": round(float(np.clip(blended["relative_humidity"], 5.0, 100.0)), 1),
+            "cape": round(float(np.clip(blended["cape"], 0.0, 5000.0)), 0),
+            "model_temp_spread": round(blended["model_temp_spread"], 2),
+            "model_rain_spread": round(blended["model_rain_spread"], 2),
+        })
+    return _score_station_rows(rows)
+
+
+def get_custom_point_horizon(
+    lat: float,
+    lon: float,
+    label: str,
+    data_mode: str,
+    nwp_model: str,
+    grid_df: pd.DataFrame,
+    state_override: Optional[str] = None,
+) -> Tuple[pd.DataFrame, str, Optional[float], Dict[str, Any]]:
+    """Score a 10-day forecast horizon for any map click or custom city point."""
+    nearest = _find_nearest_station(lat, lon)
+    state_txt = state_override or f"Near {nearest['state']}"
+    zone_txt = f"{nearest['dist_km']:.0f} km from {nearest['name'].split(' (')[0]}"
+    om_model = NWP_MODELS.get(nwp_model, {}).get("open_meteo_model", "ecmwf_ifs025")
+
+    if data_mode.startswith("Live"):
+        try:
+            loc_data = _fetch_open_meteo_point(round(lat, 4), round(lon, 4))
+            elev = float(loc_data["elevation"]) if loc_data.get("elevation") is not None else None
+            station_meta = {
+                "name": label,
+                "state": state_txt,
+                "zone": zone_txt,
+                "lat": lat,
+                "lon": lon,
+                "base_temp": nearest["base_temp"],
+            }
+            rows = _extract_location_horizon_rows(station_meta, loc_data, om_model=om_model)
+            return _score_station_rows(rows), f"Live Open-Meteo Point ({nwp_model})", elev, nearest
+        except Exception:
+            fallback_df = _build_idw_point_horizon_df(lat, lon, label, state_txt, zone_txt, grid_df)
+            return fallback_df, "Synoptic IDW Spatial Interpolation (Live fallback)", None, nearest
+
+    sim_df = _build_idw_point_horizon_df(lat, lon, label, state_txt, zone_txt, grid_df)
+    return sim_df, f"Synoptic IDW Spatial Interpolation ({nwp_model} Sim)", None, nearest
+
+
+@st.cache_data(ttl=900, show_spinner=False)
 def _build_live_horizon_df(om_model: str) -> pd.DataFrame:
     """Transform 11-day multi-model Open-Meteo hourly series into 18x10 ML features + ECMWF/GFS spread."""
     payload = _fetch_open_meteo_grid()
@@ -849,110 +1146,7 @@ def _build_live_horizon_df(om_model: str) -> pd.DataFrame:
     for station, loc_data in zip(INDIAN_MET_STATIONS, payload):
         if loc_data.get("elevation") is not None:
             elevations[station["name"]] = float(loc_data["elevation"])
-        hourly = loc_data.get("hourly", {})
-        times = hourly.get("time", [])
-
-        ec_t_arr = _first_series(hourly, "temperature_2m_ecmwf_ifs025", "temperature_2m")
-        gf_t_arr = _first_series(hourly, "temperature_2m_gfs_seamless", "temperature_2m")
-        ec_r_arr = _first_series(hourly, "precipitation_ecmwf_ifs025", "precipitation")
-        gf_r_arr = _first_series(hourly, "precipitation_gfs_seamless", "precipitation")
-
-        if om_model == "gfs_seamless":
-            temps = gf_t_arr or ec_t_arr
-            rains = gf_r_arr or ec_r_arr
-            press = _first_series(hourly, "pressure_msl_gfs_seamless", "pressure_msl_ecmwf_ifs025", "pressure_msl")
-            w10_arr = _first_series(hourly, "wind_speed_10m_gfs_seamless", "wind_speed_10m_ecmwf_ifs025", "wind_speed_10m")
-            d10_arr = _first_series(hourly, "wind_direction_10m_gfs_seamless", "wind_direction_10m_ecmwf_ifs025", "wind_direction_10m")
-            w5_arr = _first_series(hourly, "wind_speed_500hPa_gfs_seamless", "wind_speed_500hPa_ecmwf_ifs025", "wind_speed_500hPa")
-            d5_arr = _first_series(hourly, "wind_direction_500hPa_gfs_seamless", "wind_direction_500hPa_ecmwf_ifs025", "wind_direction_500hPa")
-            rh_arr = _first_series(hourly, "relative_humidity_2m_gfs_seamless", "relative_humidity_2m_ecmwf_ifs025", "relative_humidity_2m")
-        elif om_model == "best_match":
-            temps = _blend_hourly_pair(ec_t_arr, gf_t_arr)
-            rains = _blend_hourly_pair(ec_r_arr, gf_r_arr)
-            press = _blend_hourly_pair(
-                _first_series(hourly, "pressure_msl_ecmwf_ifs025", "pressure_msl"),
-                _first_series(hourly, "pressure_msl_gfs_seamless", "pressure_msl"),
-            )
-            w10_arr = _first_series(hourly, "wind_speed_10m_ecmwf_ifs025", "wind_speed_10m_gfs_seamless", "wind_speed_10m")
-            d10_arr = _first_series(hourly, "wind_direction_10m_ecmwf_ifs025", "wind_direction_10m_gfs_seamless", "wind_direction_10m")
-            w5_arr = _first_series(hourly, "wind_speed_500hPa_ecmwf_ifs025", "wind_speed_500hPa_gfs_seamless", "wind_speed_500hPa")
-            d5_arr = _first_series(hourly, "wind_direction_500hPa_ecmwf_ifs025", "wind_direction_500hPa_gfs_seamless", "wind_direction_500hPa")
-            rh_arr = _blend_hourly_pair(
-                _first_series(hourly, "relative_humidity_2m_ecmwf_ifs025", "relative_humidity_2m"),
-                _first_series(hourly, "relative_humidity_2m_gfs_seamless", "relative_humidity_2m"),
-            )
-        else:
-            temps = ec_t_arr or gf_t_arr
-            rains = ec_r_arr or gf_r_arr
-            press = _first_series(hourly, "pressure_msl_ecmwf_ifs025", "pressure_msl_gfs_seamless", "pressure_msl")
-            w10_arr = _first_series(hourly, "wind_speed_10m_ecmwf_ifs025", "wind_speed_10m_gfs_seamless", "wind_speed_10m")
-            d10_arr = _first_series(hourly, "wind_direction_10m_ecmwf_ifs025", "wind_direction_10m_gfs_seamless", "wind_direction_10m")
-            w5_arr = _first_series(hourly, "wind_speed_500hPa_ecmwf_ifs025", "wind_speed_500hPa_gfs_seamless", "wind_speed_500hPa")
-            d5_arr = _first_series(hourly, "wind_direction_500hPa_ecmwf_ifs025", "wind_direction_500hPa_gfs_seamless", "wind_direction_500hPa")
-            rh_arr = _first_series(hourly, "relative_humidity_2m_ecmwf_ifs025", "relative_humidity_2m_gfs_seamless", "relative_humidity_2m")
-
-        # Keep GFS CAPE primary to stay distribution-aligned with Open-Meteo archive training data
-        cape_arr = _first_series(hourly, "cape_gfs_seamless", "cape_ecmwf_ifs025", "cape")
-
-        for lead_day in range(1, 11):
-            start = lead_day * 24
-            end = (lead_day + 1) * 24
-            if len(times) < end:
-                raise RuntimeError("Incomplete Open-Meteo horizon array")
-
-            day_temps = [float(x) for x in temps[start:end] if x is not None]
-            day_rains = [float(x) for x in rains[start:end] if x is not None]
-            ec_t_day = [float(x) for x in ec_t_arr[start:end] if x is not None]
-            gf_t_day = [float(x) for x in gf_t_arr[start:end] if x is not None]
-            ec_r_day = [float(x) for x in ec_r_arr[start:end] if x is not None]
-            gf_r_day = [float(x) for x in gf_r_arr[start:end] if x is not None]
-            rh_day = [float(x) for x in rh_arr[start:end] if x is not None]
-            cape_day = [float(x) for x in cape_arr[start:end] if x is not None]
-
-            # Same-hour 24h pressure tendency removes the ~4 hPa tropical diurnal tide
-            drops_24h = [
-                float(press[idx - 24]) - float(press[idx])
-                for idx in range(start, end)
-                if idx < len(press) and press[idx - 24] is not None and press[idx] is not None
-            ]
-            shears = [
-                _vector_wind_shear(
-                    float(w10_arr[idx]),
-                    float(d10_arr[idx]),
-                    float(w5_arr[idx]),
-                    float(d5_arr[idx]),
-                )
-                for idx in range(start, end)
-                if idx < len(w10_arr) and idx < len(d10_arr) and idx < len(w5_arr) and idx < len(d5_arr)
-                and None not in (w10_arr[idx], d10_arr[idx], w5_arr[idx], d5_arr[idx])
-            ]
-
-            pred_temp = max(day_temps) if day_temps else station["base_temp"]
-            pred_rain = sum(day_rains) if day_rains else 0.0
-            p_drop = max([0.5] + drops_24h)
-            shear_85 = float(np.percentile(shears, 85)) if shears else 12.0
-            rh_mean = float(np.mean(rh_day)) if rh_day else 65.0
-            cape_max = max(cape_day) if cape_day else 0.0
-            t_spread = abs(max(ec_t_day) - max(gf_t_day)) if (ec_t_day and gf_t_day) else 0.8
-            r_spread = abs(sum(ec_r_day) - sum(gf_r_day)) if (ec_r_day and gf_r_day) else 1.0
-
-            rows.append({
-                "lead_day": lead_day,
-                "forecast_date": str(times[start])[:10],
-                "station_name": station["name"],
-                "state": station["state"],
-                "zone": station["zone"],
-                "lat": station["lat"],
-                "lon": station["lon"],
-                "predicted_temp": round(pred_temp, 1),
-                "predicted_rainfall": round(max(0.0, pred_rain), 1),
-                "wind_shear": round(float(np.clip(shear_85, 4.0, 50.0)), 2),
-                "pressure_drop": round(float(np.clip(p_drop, 0.5, 30.0)), 2),
-                "relative_humidity": round(float(np.clip(rh_mean, 5.0, 100.0)), 1),
-                "cape": round(float(np.clip(cape_max, 0.0, 5000.0)), 0),
-                "model_temp_spread": round(t_spread, 2),
-                "model_rain_spread": round(r_spread, 2),
-            })
+        rows.extend(_extract_location_horizon_rows(station, loc_data, om_model=om_model))
 
     scored_df = _score_station_rows(rows)
     try:
@@ -1447,6 +1641,619 @@ def render_driver_cards(factors: List[Dict[str, Any]]) -> None:
     st.markdown(f'<div class="driver-grid">{"".join(cards_html)}</div>', unsafe_allow_html=True)
 
 
+@st.cache_data(ttl=120, show_spinner=False)
+def load_verified_scorecard_df(cache_nonce: int = 0) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Load joined forecast-vs-observation pairs from SQL DB and align evaluation splits."""
+    import db as db_mod
+
+    _ = cache_nonce
+    rows = db_mod.fetch_verified_training_records(limit=25000)
+    if hasattr(db_mod, "get_pending_verification_summary"):
+        pending_info = db_mod.get_pending_verification_summary()
+    else:
+        pending_info = {
+            "pending_past_pairs": 0,
+            "live_forward_runs": 0,
+            "live_verified_pairs": 0,
+            "min_verified_date": None,
+            "max_verified_date": None,
+        }
+    if not rows:
+        return pd.DataFrame(), pending_info
+
+    df = pd.DataFrame(rows)
+    numeric_cols = [
+        "lead_day",
+        "predicted_temp",
+        "actual_temp",
+        "predicted_rainfall",
+        "actual_rainfall",
+        "wind_shear",
+        "pressure_drop",
+        "cape",
+        "relative_humidity",
+        "model_temp_spread",
+        "model_rain_spread",
+        "predicted_bust_prob",
+        "temp_error",
+        "rainfall_error",
+        "is_bust",
+    ]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df["valid_date"] = df["valid_date"].astype(str).str.slice(0, 10)
+    df["issued_date"] = df["issued_date"].astype(str).str.slice(0, 10)
+    df["station_name"] = df["station_name"].astype(str)
+    df["climatic_zone"] = df["climatic_zone"].astype(str)
+    df["nwp_model"] = df["nwp_model"].astype(str)
+    df["is_bust"] = df["is_bust"].fillna(0).astype(int)
+
+    has_saved_prob = df["predicted_bust_prob"].notna()
+    df["prob_origin"] = np.where(has_saved_prob, "Issuance Snapshot", "Retrospective Model Score")
+    missing_mask = ~has_saved_prob
+    if missing_mask.any():
+        bundle = load_model_bundle()
+        feature_cols = bundle["feature_names"]
+        X_missing = _align_feature_frame(df.loc[missing_mask], feature_cols)
+        df.loc[missing_mask, "predicted_bust_prob"] = bundle["model"].predict_proba(X_missing)[:, 1]
+
+    df["predicted_bust_prob"] = df["predicted_bust_prob"].clip(0.0, 1.0)
+    df["predicted_bust_pct"] = np.round(df["predicted_bust_prob"] * 100.0, 2)
+    df["temp_bust_actual"] = (df["temp_error"] > 3.0).astype(int)
+    df["rain_bust_actual"] = (df["rainfall_error"] > 15.0).astype(int)
+    df["actual_outcome"] = np.where(df["is_bust"] == 1, "BUST", "Reliable")
+
+    bundle_meta = load_model_bundle().get("metadata", {})
+    test_range = str(bundle_meta.get("test_date_range") or "")
+    holdout_start = test_range.split("..")[0].strip() if ".." in test_range else ""
+
+    is_live_run = df["nwp_model"] != "open_meteo_multihorizon"
+    is_holdout = (~is_live_run) & bool(holdout_start) & (df["valid_date"] >= holdout_start)
+    df["eval_split"] = np.where(
+        is_live_run,
+        "Live Forward Run",
+        np.where(is_holdout, "Chronological Hold-Out", "Archive Train Window"),
+    )
+    return df, pending_info
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def maybe_auto_verify_past_snapshots(pending_past_pairs: int) -> int:
+    """Best-effort Day-0 actuals backfill when past live forecast runs await verification."""
+    if pending_past_pairs <= 0:
+        return 0
+    try:
+        import importlib
+        import data_pipeline
+
+        importlib.reload(data_pipeline)
+        res = data_pipeline.sync_recent_observations_to_db(past_days=14)
+        return int(res.get("observation_rows", 0) or 0)
+    except Exception:
+        return 0
+
+
+def _compute_scorecard_metrics(fdf: pd.DataFrame, alert_threshold: int) -> Dict[str, Any]:
+    """Compute discrimination, calibration, error, and alert-capture metrics on verified rows."""
+    from sklearn.metrics import brier_score_loss, roc_auc_score
+
+    n_rows = int(len(fdf))
+    if n_rows == 0:
+        return {"n_rows": 0}
+
+    y_true = fdf["is_bust"].astype(int).values
+    y_prob = np.clip(fdf["predicted_bust_prob"].astype(float).values, 0.0, 1.0)
+    n_busts = int(y_true.sum())
+    obs_bust_rate = (n_busts / n_rows) * 100.0
+    temp_mae = float(fdf["temp_error"].mean())
+    rain_mae = float(fdf["rainfall_error"].mean())
+    temp_busts = int(fdf["temp_bust_actual"].sum())
+    rain_busts = int(fdf["rain_bust_actual"].sum())
+
+    roc_auc = float(roc_auc_score(y_true, y_prob)) if len(np.unique(y_true)) >= 2 else None
+    brier = float(brier_score_loss(y_true, y_prob))
+
+    alerted = (y_prob * 100.0) >= float(alert_threshold)
+    flagged_n = int(alerted.sum())
+    tp_n = int((alerted & (y_true == 1)).sum())
+    precision = (tp_n / flagged_n * 100.0) if flagged_n > 0 else 0.0
+    recall = (tp_n / n_busts * 100.0) if n_busts > 0 else 0.0
+
+    return {
+        "n_rows": n_rows,
+        "n_busts": n_busts,
+        "obs_bust_rate": obs_bust_rate,
+        "temp_mae": temp_mae,
+        "rain_mae": rain_mae,
+        "temp_busts": temp_busts,
+        "rain_busts": rain_busts,
+        "roc_auc": roc_auc,
+        "brier": brier,
+        "flagged_n": flagged_n,
+        "tp_n": tp_n,
+        "precision": precision,
+        "recall": recall,
+    }
+
+
+def build_lead_decay_figure(fdf: pd.DataFrame) -> go.Figure:
+    """Compare Observed Bust Rate vs Model Predicted Risk across forecast lead horizons."""
+    grouped = (
+        fdf.groupby("lead_day", as_index=False)
+        .agg(
+            n=("is_bust", "count"),
+            obs_rate=("is_bust", lambda s: float(s.mean()) * 100.0),
+            pred_rate=("predicted_bust_pct", "mean"),
+            temp_mae=("temp_error", "mean"),
+            rain_mae=("rainfall_error", "mean"),
+        )
+        .sort_values("lead_day")
+    )
+    x_labels = [f"Day +{int(d)}" for d in grouped["lead_day"]]
+    hover_obs = [
+        f"<b>Day +{int(r.lead_day)}</b><br>"
+        f"Observed Bust Rate: <b>{r.obs_rate:.1f}%</b> ({int(r.n):,} pairs)<br>"
+        f"Temp MAE: {r.temp_mae:.2f} °C · Rain MAE: {r.rain_mae:.1f} mm"
+        for r in grouped.itertuples()
+    ]
+    hover_pred = [
+        f"<b>Day +{int(r.lead_day)}</b><br>"
+        f"Mean Predicted Risk: <b>{r.pred_rate:.1f}%</b> ({int(r.n):,} pairs)"
+        for r in grouped.itertuples()
+    ]
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=x_labels,
+            y=grouped["obs_rate"],
+            name="Observed Bust Rate (%)",
+            marker=dict(color=PALETTE["terracotta"], line=dict(color=PALETTE["espresso"], width=0.8)),
+            text=[f"{v:.1f}%" for v in grouped["obs_rate"]],
+            textposition="outside",
+            hoverinfo="text",
+            hovertext=hover_obs,
+        )
+    )
+    fig.add_trace(
+        go.Bar(
+            x=x_labels,
+            y=grouped["pred_rate"],
+            name="Mean Predicted Risk (%)",
+            marker=dict(color=PALETTE["amber"], line=dict(color=PALETTE["espresso"], width=0.8)),
+            text=[f"{v:.1f}%" for v in grouped["pred_rate"]],
+            textposition="outside",
+            hoverinfo="text",
+            hovertext=hover_pred,
+        )
+    )
+    y_max = max(list(grouped["obs_rate"]) + list(grouped["pred_rate"]) + [25.0]) * 1.28
+    fig.update_layout(
+        title=dict(
+            text="Lead-Time Error & Bust Decay by Horizon",
+            x=0.01,
+            font=dict(size=14, color=PALETTE["espresso"], family="DM Sans, sans-serif"),
+        ),
+        barmode="group",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0.0, font=dict(size=11.5, color=PALETTE["espresso"])),
+        xaxis=dict(gridcolor="#EDE0C9", tickfont=dict(color=PALETTE["espresso"], family="IBM Plex Mono, monospace", size=11)),
+        yaxis=dict(
+            title=dict(text="Rate (%)", font=dict(size=11.5, color=PALETTE["muted_brown"])),
+            range=[0, min(105.0, y_max)],
+            gridcolor="#EDE0C9",
+            tickfont=dict(color=PALETTE["muted_brown"], family="IBM Plex Mono, monospace", size=10.5),
+        ),
+        paper_bgcolor=PALETTE["surface"],
+        plot_bgcolor=PALETTE["cream"],
+        margin=dict(l=12, r=16, t=68, b=34),
+        height=310,
+    )
+    return fig
+
+
+def build_calibration_figure(fdf: pd.DataFrame) -> go.Figure:
+    """Plot reliability diagram comparing predicted bust risk bins against observed bust frequency."""
+    bins = [0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 75.0, 100.1]
+    work = fdf[["predicted_bust_pct", "is_bust"]].copy()
+    work["bin"] = pd.cut(work["predicted_bust_pct"], bins=bins, include_lowest=True, right=False)
+    cal = (
+        work.groupby("bin", observed=True, as_index=False)
+        .agg(
+            mean_pred=("predicted_bust_pct", "mean"),
+            obs_freq=("is_bust", lambda s: float(s.mean()) * 100.0),
+            n=("is_bust", "count"),
+        )
+        .dropna()
+    )
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=[0, 100],
+            y=[0, 100],
+            mode="lines",
+            line=dict(color=PALETTE["muted_brown"], dash="dash", width=1.4),
+            name="Perfect Calibration",
+            hoverinfo="skip",
+        )
+    )
+    if not cal.empty:
+        sizes = [float(np.clip(8.0 + math.sqrt(n) * 0.65, 9.0, 24.0)) for n in cal["n"]]
+        hover_cal = [
+            f"<b>Predicted Mean: {r.mean_pred:.1f}%</b><br>"
+            f"Observed Bust Rate: <b>{r.obs_freq:.1f}%</b><br>"
+            f"Sample Count: {int(r.n):,}"
+            for r in cal.itertuples()
+        ]
+        fig.add_trace(
+            go.Scatter(
+                x=cal["mean_pred"],
+                y=cal["obs_freq"],
+                mode="lines+markers",
+                line=dict(color=PALETTE["terracotta"], width=2.8),
+                marker=dict(size=sizes, color=PALETTE["terracotta"], line=dict(color=PALETTE["espresso"], width=1.2)),
+                name="Observed vs Predicted",
+                hoverinfo="text",
+                hovertext=hover_cal,
+            )
+        )
+
+    fig.update_layout(
+        title=dict(
+            text="Probability Calibration Curve (Reliability)",
+            x=0.01,
+            font=dict(size=14, color=PALETTE["espresso"], family="DM Sans, sans-serif"),
+        ),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0.0, font=dict(size=11.5, color=PALETTE["espresso"])),
+        xaxis=dict(
+            title=dict(text="Mean Predicted Risk (%)", font=dict(size=11.5, color=PALETTE["muted_brown"])),
+            range=[-2, 102],
+            gridcolor="#EDE0C9",
+            tickfont=dict(color=PALETTE["muted_brown"], family="IBM Plex Mono, monospace", size=10.5),
+        ),
+        yaxis=dict(
+            title=dict(text="Observed Bust Rate (%)", font=dict(size=11.5, color=PALETTE["muted_brown"])),
+            range=[-2, 102],
+            gridcolor="#EDE0C9",
+            tickfont=dict(color=PALETTE["muted_brown"], family="IBM Plex Mono, monospace", size=10.5),
+        ),
+        paper_bgcolor=PALETTE["surface"],
+        plot_bgcolor=PALETTE["cream"],
+        margin=dict(l=12, r=16, t=68, b=36),
+        height=310,
+    )
+    return fig
+
+
+def build_station_scorecard_figure(fdf: pd.DataFrame) -> go.Figure:
+    """Rank top synoptic stations or climatic regimes by observed bust frequency."""
+    work = fdf.copy()
+    work["short_station"] = work["station_name"].str.split(" (").str[0]
+    grp = (
+        work.groupby("short_station", as_index=False)
+        .agg(
+            n=("is_bust", "count"),
+            obs_rate=("is_bust", lambda s: float(s.mean()) * 100.0),
+            pred_rate=("predicted_bust_pct", "mean"),
+            temp_mae=("temp_error", "mean"),
+            rain_mae=("rainfall_error", "mean"),
+        )
+        .sort_values("obs_rate", ascending=False)
+        .head(10)
+    )
+    hover_txt = [
+        f"<b>{r.short_station}</b><br>"
+        f"Observed Busts: <b>{r.obs_rate:.1f}%</b> ({int(r.n):,} runs)<br>"
+        f"Predicted Mean: {r.pred_rate:.1f}%<br>"
+        f"MAE: {r.temp_mae:.2f}°C · {r.rain_mae:.1f}mm"
+        for r in grp.itertuples()
+    ]
+    x_max = max(list(grp["obs_rate"]) + list(grp["pred_rate"]) + [25.0]) * 1.24
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            y=grp["short_station"],
+            x=grp["obs_rate"],
+            orientation="h",
+            name="Observed Bust %",
+            marker=dict(color=PALETTE["critical_red"], line=dict(color=PALETTE["espresso"], width=0.8)),
+            text=[f"{v:.1f}%" for v in grp["obs_rate"]],
+            textposition="outside",
+            hoverinfo="text",
+            hovertext=hover_txt,
+        )
+    )
+    fig.add_trace(
+        go.Bar(
+            y=grp["short_station"],
+            x=grp["pred_rate"],
+            orientation="h",
+            name="Predicted Mean %",
+            marker=dict(color=PALETTE["amber"], line=dict(color=PALETTE["espresso"], width=0.7)),
+            hoverinfo="text",
+            hovertext=hover_txt,
+        )
+    )
+    fig.update_layout(
+        title=dict(
+            text="Highest-Vulnerability Stations (Top 10)",
+            x=0.01,
+            font=dict(size=14, color=PALETTE["espresso"], family="DM Sans, sans-serif"),
+        ),
+        barmode="group",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0.0, font=dict(size=11, color=PALETTE["espresso"])),
+        xaxis=dict(
+            title=dict(text="Bust Rate (%)", font=dict(size=11, color=PALETTE["muted_brown"])),
+            range=[0, min(105.0, x_max)],
+            gridcolor="#EDE0C9",
+            tickfont=dict(color=PALETTE["muted_brown"], family="IBM Plex Mono, monospace", size=10),
+        ),
+        yaxis=dict(autorange="reversed", automargin=True, tickfont=dict(color=PALETTE["espresso"], size=11)),
+        paper_bgcolor=PALETTE["surface"],
+        plot_bgcolor=PALETTE["cream"],
+        margin=dict(l=10, r=20, t=68, b=34),
+        height=340,
+    )
+    return fig
+
+
+def build_verification_timeline_figure(fdf: pd.DataFrame) -> go.Figure:
+    """Plot chronological daily observed bust rates vs model predicted bust risk."""
+    daily = (
+        fdf.groupby("valid_date", as_index=False)
+        .agg(
+            n=("is_bust", "count"),
+            busts=("is_bust", "sum"),
+            obs_rate=("is_bust", lambda s: float(s.mean()) * 100.0),
+            pred_rate=("predicted_bust_pct", "mean"),
+        )
+        .sort_values("valid_date")
+    )
+    window = 7 if len(daily) >= 14 else 1
+    daily["obs_roll"] = daily["obs_rate"].rolling(window, min_periods=1).mean()
+    daily["pred_roll"] = daily["pred_rate"].rolling(window, min_periods=1).mean()
+    roll_label = f"{window}d Rolling" if window > 1 else "Daily"
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=daily["valid_date"],
+            y=daily["obs_rate"],
+            name="Daily Bust Rate (%)",
+            marker=dict(color="rgba(212, 98, 26, 0.22)"),
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=daily["valid_date"],
+            y=daily["obs_roll"],
+            mode="lines",
+            name=f"Observed ({roll_label} %)",
+            line=dict(color=PALETTE["critical_red"], width=2.4),
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=daily["valid_date"],
+            y=daily["pred_roll"],
+            mode="lines",
+            name=f"Predicted Risk ({roll_label} %)",
+            line=dict(color=PALETTE["sage_green"], width=2.2, dash="dot"),
+        )
+    )
+    fig.update_layout(
+        title=dict(
+            text="Verification Timeline: Predicted Risk vs Observed Busts",
+            x=0.01,
+            font=dict(size=14, color=PALETTE["espresso"], family="DM Sans, sans-serif"),
+        ),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0.0, font=dict(size=11, color=PALETTE["espresso"])),
+        xaxis=dict(gridcolor="#EDE0C9", tickfont=dict(color=PALETTE["muted_brown"], family="IBM Plex Mono, monospace", size=10)),
+        yaxis=dict(
+            title=dict(text="Bust Rate (%)", font=dict(size=11, color=PALETTE["muted_brown"])),
+            range=[0, 105],
+            gridcolor="#EDE0C9",
+            tickfont=dict(color=PALETTE["muted_brown"], family="IBM Plex Mono, monospace", size=10),
+        ),
+        paper_bgcolor=PALETTE["surface"],
+        plot_bgcolor=PALETTE["cream"],
+        margin=dict(l=12, r=16, t=68, b=34),
+        height=340,
+    )
+    return fig
+
+
+def render_scorecard_tab(alert_threshold: int) -> None:
+    """Render the live & archive Forecast-vs-Observed Verification Scorecard."""
+    st.session_state.setdefault("scorecard_nonce", 0)
+    score_df, pending_info = load_verified_scorecard_df(cache_nonce=int(st.session_state["scorecard_nonce"]))
+
+    if pending_info.get("pending_past_pairs", 0) > 0:
+        auto_synced = maybe_auto_verify_past_snapshots(int(pending_info["pending_past_pairs"]))
+        if auto_synced > 0:
+            load_verified_scorecard_df.clear()
+            st.session_state["scorecard_nonce"] += 1
+            score_df, pending_info = load_verified_scorecard_df(cache_nonce=int(st.session_state["scorecard_nonce"]))
+
+    if score_df.empty:
+        st.info(
+            "No paired verification records found in the SQL database yet. Click 'Sync 150-Day Paired Archive to DB' "
+            "in the Bulletin & Model tab or trigger a Day-0 observation sync below."
+        )
+        if st.button("Fetch Latest Day-0 Observations Now", key="sc_empty_sync"):
+            import importlib
+            import data_pipeline
+
+            importlib.reload(data_pipeline)
+            res = data_pipeline.sync_recent_observations_to_db(past_days=14)
+            load_verified_scorecard_df.clear()
+            st.session_state["scorecard_nonce"] += 1
+            st.success(f"Synced {res['observation_rows']} Day-0 observation rows.")
+            st.rerun()
+        return
+
+    date_min = pending_info.get("min_verified_date") or score_df["valid_date"].min()
+    date_max = pending_info.get("max_verified_date") or score_df["valid_date"].max()
+    live_ver_n = int(pending_info.get("live_verified_pairs", 0) or 0)
+    pending_n = int(pending_info.get("pending_past_pairs", 0) or 0)
+    st.caption(
+        f"Verified window: **{date_min}** to **{date_max}** · Ground-truth bust threshold: **>3.0 °C Temp Error** or "
+        f"**>15.0 mm 24h Rain Error** · Live forward verified: **{live_ver_n:,}** (pending past runs: **{pending_n:,}**)."
+    )
+
+    has_holdout = bool((score_df["eval_split"] == "Chronological Hold-Out").any())
+    has_live = bool((score_df["eval_split"] == "Live Forward Run").any())
+    scope_options = ["All Verified Records (Archive + Live)"]
+    if has_holdout:
+        scope_options.insert(0, "Chronological Hold-Out (Out-of-Sample)")
+    if has_live:
+        scope_options.append("Live Forward NWP Runs Only")
+
+    sc_f1, sc_f2, sc_f3, sc_f4 = st.columns([1.45, 1.25, 0.9, 0.9])
+    with sc_f1:
+        scope_choice = st.selectbox("Evaluation Scope", options=scope_options, index=0, key="sc_scope")
+    with sc_f2:
+        station_opts = ["All 18 Stations"] + sorted(score_df["station_name"].unique().tolist())
+        station_choice = st.selectbox("Station Filter", options=station_opts, index=0, key="sc_station")
+    with sc_f3:
+        lead_vals = sorted({int(x) for x in score_df["lead_day"].dropna().unique()})
+        lead_opts = ["All Leads"] + [f"Day +{d}" for d in lead_vals]
+        lead_choice = st.selectbox("Lead Horizon", options=lead_opts, index=0, key="sc_lead")
+    with sc_f4:
+        st.markdown("<div class='btn-spacer'></div>", unsafe_allow_html=True)
+        if st.button("Sync Day-0 Actuals", width="stretch", key="sc_sync_btn"):
+            try:
+                with st.spinner("Fetching Day-0 verified actuals from Open-Meteo..."):
+                    import importlib
+                    import data_pipeline
+
+                    importlib.reload(data_pipeline)
+                    sync_res = data_pipeline.sync_recent_observations_to_db(past_days=14)
+                load_verified_scorecard_df.clear()
+                st.session_state["scorecard_nonce"] += 1
+                st.success(
+                    f"Synced {sync_res['observation_rows']:,} Day-0 rows through {sync_res.get('latest_obs_date') or 'today'}."
+                )
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Day-0 observation sync failed: {exc}")
+
+    fdf = score_df.copy()
+    if scope_choice.startswith("Chronological"):
+        fdf = fdf[fdf["eval_split"] == "Chronological Hold-Out"]
+    elif scope_choice.startswith("Live Forward"):
+        fdf = fdf[fdf["eval_split"] == "Live Forward Run"]
+    if station_choice != "All 18 Stations":
+        fdf = fdf[fdf["station_name"] == station_choice]
+    if lead_choice != "All Leads":
+        target_ld = int(lead_choice.replace("Day +", "").strip())
+        fdf = fdf[fdf["lead_day"] == target_ld]
+
+    if fdf.empty:
+        st.warning("No verified records match the active filters. Try widening the scope or lead filter.")
+        return
+
+    m = _compute_scorecard_metrics(fdf, alert_threshold=alert_threshold)
+    auc_str = f"{m['roc_auc']:.3f}" if m["roc_auc"] is not None else "N/A"
+    scope_short = "Out-of-Sample" if scope_choice.startswith("Chronological") else (
+        "Live Runs" if scope_choice.startswith("Live") else "Full Verified DB"
+    )
+
+    st.markdown(
+        f"""
+<div class="kpi-grid" style="margin-top:6px;">
+  <div class="kpi-card" style="border-top: 3px solid {PALETTE['espresso']};">
+    <div class="kpi-label">Verified Forecasts</div>
+    <div class="kpi-value" style="color:{PALETTE['espresso']};">{m['n_rows']:,}</div>
+    <div class="kpi-sub">{m['n_busts']:,} actual busts ({m['temp_busts']:,} temp &middot; {m['rain_busts']:,} rain)</div>
+  </div>
+  <div class="kpi-card" style="border-top: 3px solid {PALETTE['terracotta']};">
+    <div class="kpi-label">Observed Bust Rate</div>
+    <div class="kpi-value" style="color:{PALETTE['terracotta']};">{m['obs_bust_rate']:.1f}%</div>
+    <div class="kpi-sub">MAE: {m['temp_mae']:.2f}°C temp &middot; {m['rain_mae']:.1f}mm rain</div>
+  </div>
+  <div class="kpi-card" style="border-top: 3px solid {PALETTE['amber']};">
+    <div class="kpi-label">ROC-AUC &middot; Brier Score</div>
+    <div class="kpi-value" style="color:{PALETTE['espresso']};">{auc_str}</div>
+    <div class="kpi-sub">Brier {m['brier']:.4f} &middot; {scope_short}</div>
+  </div>
+  <div class="kpi-card" style="border-top: 3px solid {PALETTE['sage_green']};">
+    <div class="kpi-label">Alert Capture (&ge;{alert_threshold}%)</div>
+    <div class="kpi-value" style="color:{PALETTE['sage_green']};">{m['precision']:.0f}% / {m['recall']:.0f}%</div>
+    <div class="kpi-sub">Prec/Rec &middot; {m['flagged_n']:,} alerts &rarr; {m['tp_n']:,} busts caught</div>
+  </div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+    sc_c1, sc_c2 = st.columns(2)
+    with sc_c1:
+        st.plotly_chart(build_lead_decay_figure(fdf), width="stretch", config={"displayModeBar": False})
+    with sc_c2:
+        st.plotly_chart(build_calibration_figure(fdf), width="stretch", config={"displayModeBar": False})
+
+    sc_c3, sc_c4 = st.columns(2)
+    with sc_c3:
+        st.plotly_chart(build_station_scorecard_figure(fdf), width="stretch", config={"displayModeBar": False})
+    with sc_c4:
+        st.plotly_chart(build_verification_timeline_figure(fdf), width="stretch", config={"displayModeBar": False})
+
+    st.markdown("**Verified Forecast-vs-Observation Audit Log (Most Recent)**")
+    audit_cols = [
+        "valid_date",
+        "station_name",
+        "nwp_model",
+        "lead_day",
+        "eval_split",
+        "predicted_temp",
+        "actual_temp",
+        "temp_error",
+        "predicted_rainfall",
+        "actual_rainfall",
+        "rainfall_error",
+        "predicted_bust_pct",
+        "actual_outcome",
+    ]
+    audit_df = fdf[[c for c in audit_cols if c in fdf.columns]].head(400)
+    sc_dl1, sc_dl2 = st.columns([2.2, 1])
+    with sc_dl1:
+        st.caption(f"Showing top {len(audit_df):,} most recent pairs of {len(fdf):,} filtered verified forecasts.")
+    with sc_dl2:
+        sc_csv = fdf[[c for c in audit_cols if c in fdf.columns]].to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label="Download Scorecard (CSV)",
+            data=sc_csv,
+            file_name=f"verification_scorecard_{scope_short.lower().replace(' ', '_')}.csv",
+            mime="text/csv",
+            width="stretch",
+            key="sc_csv_dl",
+        )
+
+    st.dataframe(
+        audit_df,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "valid_date": st.column_config.TextColumn("Valid Date", width="small"),
+            "station_name": st.column_config.TextColumn("Station", width="medium"),
+            "nwp_model": st.column_config.TextColumn("Feed", width="small"),
+            "lead_day": st.column_config.NumberColumn("Lead", format="Day +%d", width="small"),
+            "eval_split": st.column_config.TextColumn("Split", width="small"),
+            "predicted_temp": st.column_config.NumberColumn("Pred T", format="%.1f °C", width="small"),
+            "actual_temp": st.column_config.NumberColumn("Obs T", format="%.1f °C", width="small"),
+            "temp_error": st.column_config.NumberColumn("|ΔT|", format="%.2f °C", width="small"),
+            "predicted_rainfall": st.column_config.NumberColumn("Pred R", format="%.1f mm", width="small"),
+            "actual_rainfall": st.column_config.NumberColumn("Obs R", format="%.1f mm", width="small"),
+            "rainfall_error": st.column_config.NumberColumn("|ΔR|", format="%.1f mm", width="small"),
+            "predicted_bust_pct": st.column_config.NumberColumn("Bust Risk", format="%.1f%%", width="small"),
+            "actual_outcome": st.column_config.TextColumn("Outcome", width="small"),
+        },
+    )
+
+
 # Sidebar
 with st.sidebar:
     st.markdown(
@@ -1600,6 +2407,35 @@ else:
     )
 
 
+def _set_custom_point(
+    lat: float,
+    lon: float,
+    label: str,
+    state: Optional[str] = None,
+    switch_to_custom: bool = True,
+) -> Dict[str, Any]:
+    """Update active custom map/city inspection point and sync coordinate inputs."""
+    cp = {
+        "lat": round(float(lat), 4),
+        "lon": round(float(lon), 4),
+        "label": str(label),
+        "state": state,
+    }
+    st.session_state["custom_point"] = cp
+    st.session_state["custom_lat_box"] = cp["lat"]
+    st.session_state["custom_lon_box"] = cp["lon"]
+    if switch_to_custom:
+        st.session_state["diag_target_mode"] = "Custom Map Pin / City"
+    return cp
+
+
+def _clear_custom_pin() -> None:
+    """Clear active custom map pin and return diagnostics to canonical 18-station mode."""
+    st.session_state.pop("custom_point", None)
+    st.session_state.pop("city_candidates", None)
+    st.session_state["diag_target_mode"] = "18 Synoptic Stations"
+
+
 # Regional Risk Map
 st.subheader("Regional Bust Risk Map")
 st.markdown(
@@ -1608,18 +2444,28 @@ st.markdown(
         <span class="legend-item"><span class="legend-dot" style="background:{PALETTE['critical_red']};"></span> High-Risk Bust (&ge;{alert_threshold}%)</span>
         <span class="legend-item"><span class="legend-dot" style="background:{PALETTE['amber']};"></span> Elevated Watch (35&ndash;{alert_threshold}%)</span>
         <span class="legend-item"><span class="legend-dot" style="background:{PALETTE['sage_green']};"></span> Reliable (&lt;35%)</span>
+        <span class="legend-item"><span class="legend-dot" style="background:{PALETTE['espresso']}; border:2px solid {PALETTE['terracotta']};"></span> Custom Map Pin (Click anywhere on map)</span>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
+active_custom_pin = st.session_state.get("custom_point")
 india_map = folium.Map(
     location=[22.2, 80.5],
     zoom_start=4,
     tiles="OpenStreetMap",
     control_scale=True,
 )
-india_map.fit_bounds([[8.0, 68.5], [35.2, 95.5]])
+if active_custom_pin:
+    cp_lat = float(active_custom_pin["lat"])
+    cp_lon = float(active_custom_pin["lon"])
+    india_map.fit_bounds([
+        [min(8.0, cp_lat - 1.5), min(68.5, cp_lon - 1.5)],
+        [max(35.2, cp_lat + 1.5), max(95.5, cp_lon + 1.5)],
+    ])
+else:
+    india_map.fit_bounds([[8.0, 68.5], [35.2, 95.5]])
 
 # Subtle warm parchment tint on map tiles so OSM blends naturally with #FEF3E2
 india_map.get_root().header.add_child(
@@ -1685,30 +2531,203 @@ for _, row in df_stations.iterrows():
         weight=1.5,
     ).add_to(india_map)
 
-# returned_objects=[] avoids triggering a full script rerun on map pan/zoom
-st_folium(india_map, use_container_width=True, height=430, returned_objects=[])
+if active_custom_pin:
+    cp_lat = float(active_custom_pin["lat"])
+    cp_lon = float(active_custom_pin["lon"])
+    folium.CircleMarker(
+        location=[cp_lat, cp_lon],
+        radius=16,
+        color=PALETTE["espresso"],
+        fill=True,
+        fill_color=PALETTE["terracotta"],
+        fill_opacity=0.22,
+        weight=2,
+        interactive=False,
+    ).add_to(india_map)
+    crosshair_html = (
+        f'<div style="width:18px;height:18px;border-radius:50%;background:{PALETTE["espresso"]};'
+        f'border:3px solid {PALETTE["amber"]};box-shadow:0 2px 6px rgba(42,26,14,0.45);"></div>'
+    )
+    folium.Marker(
+        location=[cp_lat, cp_lon],
+        icon=folium.DivIcon(icon_size=(18, 18), icon_anchor=(9, 9), html=crosshair_html),
+        tooltip=f"Custom Pin: {active_custom_pin['label']} ({cp_lat:.2f}°N, {cp_lon:.2f}°E)",
+        popup=f"<b>Custom Inspection Point</b><br>{active_custom_pin['label']}<br>{cp_lat:.4f}°N, {cp_lon:.4f}°E",
+    ).add_to(india_map)
+
+# Capture only explicit map clicks (pan/zoom do not trigger reruns)
+map_state = st_folium(
+    india_map,
+    use_container_width=True,
+    height=430,
+    returned_objects=["last_clicked"],
+    key="india_risk_map",
+)
+
+clicked_coords = map_state.get("last_clicked") if isinstance(map_state, dict) else None
+if clicked_coords and clicked_coords.get("lat") is not None and clicked_coords.get("lng") is not None:
+    click_sig = (round(float(clicked_coords["lat"]), 4), round(float(clicked_coords["lng"]), 4))
+    if st.session_state.get("_last_map_click_sig") != click_sig:
+        st.session_state["_last_map_click_sig"] = click_sig
+        st.session_state.pop("city_candidates", None)
+        _set_custom_point(
+            lat=click_sig[0],
+            lon=click_sig[1],
+            label=f"Map Pin ({click_sig[0]:.2f}°N, {click_sig[1]:.2f}°E)",
+            switch_to_custom=True,
+        )
+        st.rerun()
+
+if st.session_state.get("custom_point"):
+    cp_bar = st.session_state["custom_point"]
+    pin_c1, pin_c2 = st.columns([4.2, 1])
+    with pin_c1:
+        st.info(
+            f"Active Custom Point: **{cp_bar['label']}** ({cp_bar['lat']:.4f}°N, {cp_bar['lon']:.4f}°E) — "
+            "scored live in **Diagnostics & Horizon -> Custom Map Pin / City** below."
+        )
+    with pin_c2:
+        st.button("Clear Map Pin", width="stretch", on_click=_clear_custom_pin, key="clear_pin_banner")
+else:
+    st.caption(
+        "Tip: Click anywhere on the map above to run live NWP bust + SHAP diagnostics for any town, highway, or farm — "
+        "or switch to **Custom Map Pin / City** inside Diagnostics & Horizon."
+    )
 
 
 # Operational Diagnostics Tabs
 st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
-tab_diag, tab_whatif, tab_bulletin = st.tabs([
+tab_diag, tab_whatif, tab_scorecard, tab_bulletin = st.tabs([
     "Diagnostics & Horizon",
     "What-If Simulator",
+    "Verification Scorecard",
     "Bulletin & Model",
 ])
 
 with tab_diag:
-    st.caption("Inspect SHAP drivers for any station alongside its full Day +1 to Day +10 predictability curve.")
-    station_options = df_stations["station_name"].tolist()
-    selected_name = st.selectbox(
-        "Inspect Station",
-        options=station_options,
-        index=top_pos,
+    st.session_state.setdefault("diag_target_mode", "18 Synoptic Stations")
+    diag_target_mode = st.radio(
+        "Inspection Scope",
+        ["18 Synoptic Stations", "Custom Map Pin / City"],
+        horizontal=True,
+        key="diag_target_mode",
     )
 
-    sel = df_stations[df_stations["station_name"] == selected_name].iloc[0]
+    if diag_target_mode == "18 Synoptic Stations":
+        st.caption("Inspect SHAP drivers for any synoptic station alongside its full Day +1 to Day +10 predictability curve.")
+        station_options = df_stations["station_name"].tolist()
+        selected_name = st.selectbox(
+            "Inspect Station",
+            options=station_options,
+            index=top_pos,
+        )
+        sel = df_stations[df_stations["station_name"] == selected_name].iloc[0]
+        target_horizon_df = horizon_df[horizon_df["station_name"] == selected_name]
+        panel_title = str(sel["station_name"])
+        sel_short = panel_title.split(" (")[0]
+        meta_line = f"{sel['state']} &middot; {sel['zone']} &middot; {float(sel['lat']):.2f}°N, {float(sel['lon']):.2f}°E"
+        footer_source_override: Optional[str] = None
+    else:
+        st.caption("Click any coordinate on the map above, search a city/town, or enter custom latitude/longitude for live multi-model NWP scoring.")
+        cp_active = st.session_state.get("custom_point") or {
+            "lat": 26.8393,
+            "lon": 80.9231,
+            "label": "Lucknow, Uttar Pradesh, India",
+            "state": "Uttar Pradesh",
+        }
+        st.session_state.setdefault("custom_point", cp_active)
+        st.session_state.setdefault("custom_lat_box", float(cp_active["lat"]))
+        st.session_state.setdefault("custom_lon_box", float(cp_active["lon"]))
+
+        cs_c1, cs_c2 = st.columns([3.2, 1])
+        with cs_c1:
+            city_query = st.text_input(
+                "Search City or Town",
+                placeholder="e.g., Lucknow, Varanasi, Darjeeling, Surat, Shillong",
+                key="city_search_input",
+            )
+        with cs_c2:
+            st.markdown("<div class='btn-spacer'></div>", unsafe_allow_html=True)
+            if st.button("Find & Score City", width="stretch", key="find_city_btn"):
+                matches = geocode_city_candidates(city_query)
+                if matches:
+                    st.session_state["city_candidates"] = matches
+                    st.session_state.pop("city_candidate_picker", None)
+                    top_match = matches[0]
+                    _set_custom_point(
+                        lat=top_match["lat"],
+                        lon=top_match["lon"],
+                        label=top_match["label"],
+                        state=top_match["admin1"] or top_match["country"] or None,
+                        switch_to_custom=True,
+                    )
+                    st.rerun()
+                else:
+                    st.warning("No matching city found in Open-Meteo Geocoder. Try another spelling or click the map.")
+
+        candidates = st.session_state.get("city_candidates") or []
+        if len(candidates) > 1:
+            def _on_pick_city_candidate() -> None:
+                picked = st.session_state.get("city_candidate_picker")
+                if isinstance(picked, dict):
+                    _set_custom_point(
+                        lat=picked["lat"],
+                        lon=picked["lon"],
+                        label=picked["label"],
+                        state=picked.get("admin1") or picked.get("country") or None,
+                        switch_to_custom=True,
+                    )
+
+            st.selectbox(
+                "Matching Locations",
+                options=candidates,
+                format_func=lambda item: f"{item['label']} ({item['lat']:.2f}°N, {item['lon']:.2f}°E)",
+                key="city_candidate_picker",
+                on_change=_on_pick_city_candidate,
+            )
+
+        cp_active = st.session_state["custom_point"]
+        ll_c1, ll_c2, ll_c3, ll_c4 = st.columns([1, 1, 1, 1])
+        with ll_c1:
+            lat_in = st.number_input("Latitude (°N)", min_value=-60.0, max_value=60.0, step=0.05, format="%.4f", key="custom_lat_box")
+        with ll_c2:
+            lon_in = st.number_input("Longitude (°E)", min_value=-180.0, max_value=180.0, step=0.05, format="%.4f", key="custom_lon_box")
+        with ll_c3:
+            st.markdown("<div class='btn-spacer'></div>", unsafe_allow_html=True)
+            if st.button("Score Coords", width="stretch", key="score_coords_btn"):
+                st.session_state["custom_point"] = {
+                    "lat": round(float(lat_in), 4),
+                    "lon": round(float(lon_in), 4),
+                    "label": f"Custom Coords ({float(lat_in):.2f}°N, {float(lon_in):.2f}°E)",
+                    "state": None,
+                }
+                st.session_state.pop("city_candidates", None)
+                st.session_state.pop("city_candidate_picker", None)
+                st.rerun()
+        with ll_c4:
+            st.markdown("<div class='btn-spacer'></div>", unsafe_allow_html=True)
+            st.button("Reset to Grid", width="stretch", on_click=_clear_custom_pin, key="reset_pin_btn")
+
+        target_horizon_df, cp_source, cp_elev, nearest_info = get_custom_point_horizon(
+            lat=float(cp_active["lat"]),
+            lon=float(cp_active["lon"]),
+            label=str(cp_active["label"]),
+            data_mode=data_mode,
+            nwp_model=nwp_model,
+            grid_df=horizon_df,
+            state_override=cp_active.get("state"),
+        )
+        sel = target_horizon_df[target_horizon_df["lead_day"] == lead_day].iloc[0]
+        panel_title = str(cp_active["label"])
+        sel_short = panel_title.split(",")[0].split(" (")[0]
+        elev_str = f" &middot; Elev {cp_elev:.0f}m" if cp_elev is not None else ""
+        meta_line = (
+            f"{sel['state']} &middot; {nearest_info['dist_km']:.0f} km from {nearest_info['name'].split(' (')[0]}"
+            f"{elev_str} &middot; {float(sel['lat']):.2f}°N, {float(sel['lon']):.2f}°E"
+        )
+        footer_source_override = cp_source
+
     sel_risk = float(sel["risk_percentage"])
-    sel_short = selected_name.split(" (")[0]
     sel_rh = float(sel.get("relative_humidity", 65.0))
     sel_cape = float(sel.get("cape", 250.0))
     sel_tspread = float(sel.get("model_temp_spread", 1.0))
@@ -1732,19 +2751,20 @@ with tab_diag:
         top_k=3,
     )
     factors = shap_result["factors"]
+    effective_source = footer_source_override or shap_result["source"]
 
     col_info, col_chart = st.columns([1, 1.35])
     with col_info:
         render_station_panel(
-            title=sel["station_name"],
-            meta_line=f"{sel['state']} &middot; {sel['zone']} &middot; {sel['lat']:.2f}°N, {sel['lon']:.2f}°E",
+            title=panel_title,
+            meta_line=meta_line,
             risk_pct=sel_risk,
             alert_threshold=alert_threshold,
             temp=sel["predicted_temp"],
             rainfall=sel["predicted_rainfall"],
             shear=sel["wind_shear"],
             pdrop=sel["pressure_drop"],
-            footer_meta=f"Day +{lead_day} ({active_date}, {lead_day * 24}h) &middot; {shap_result['source']}",
+            footer_meta=f"Day +{lead_day} ({sel.get('forecast_date', active_date)}, {lead_day * 24}h) &middot; {effective_source}",
             temp_bust_pct=sel_tbust,
             rain_bust_pct=sel_rbust,
             spread_t=sel_tspread,
@@ -1759,8 +2779,40 @@ with tab_diag:
 
     render_driver_cards(factors)
 
-    station_horizon_df = horizon_df[horizon_df["station_name"] == selected_name]
-    horizon_fig = build_horizon_figure(station_horizon_df, sel_short, alert_threshold, lead_day)
+    if diag_target_mode != "18 Synoptic Stations":
+        if st.button("Log Custom Point Inspection to Audit DB", key="log_custom_point_db"):
+            try:
+                from db import log_prediction
+
+                bundle_meta = load_model_bundle().get("metadata", {})
+                model_ver = str(bundle_meta.get("pipeline_version", "v3-multihorizon-spread-10728"))
+                log_prediction(
+                    input_features={
+                        "predicted_temp": float(sel["predicted_temp"]),
+                        "predicted_rainfall": float(sel["predicted_rainfall"]),
+                        "wind_shear": float(sel["wind_shear"]),
+                        "pressure_drop": float(sel["pressure_drop"]),
+                        "lead_day": int(lead_day),
+                        "relative_humidity": sel_rh,
+                        "cape": sel_cape,
+                        "model_temp_spread": sel_tspread,
+                        "model_rain_spread": sel_rspread,
+                    },
+                    risk_prob_pct=sel_risk,
+                    risk_level=str(sel.get("risk_level", "Elevated")),
+                    shap_factors=factors,
+                    model_version=model_ver,
+                    latitude=float(sel["lat"]),
+                    longitude=float(sel["lon"]),
+                    station_name=panel_title,
+                    lead_time_hours=int(lead_day) * 24,
+                    source="dashboard_custom_pin",
+                )
+                st.success(f"Saved inspection for **{panel_title}** (`{sel_risk:.1f}%`) to SQL audit log (`prediction_logs`).")
+            except Exception as exc:
+                st.warning(f"Could not write audit log entry: {exc}")
+
+    horizon_fig = build_horizon_figure(target_horizon_df, sel_short, alert_threshold, lead_day)
     st.plotly_chart(horizon_fig, width="stretch", config={"displayModeBar": False})
 
 with tab_whatif:
@@ -1869,6 +2921,9 @@ with tab_whatif:
         st.plotly_chart(sim_fig, width="stretch", config={"displayModeBar": False})
 
     render_driver_cards(custom_res["factors"])
+
+with tab_scorecard:
+    render_scorecard_tab(alert_threshold=alert_threshold)
 
 with tab_bulletin:
     sorted_df = df_stations.sort_values(by="risk_percentage", ascending=False).reset_index(drop=True)
@@ -2121,6 +3176,7 @@ with tab_bulletin:
 
                         importlib.reload(data_pipeline)
                         synced = data_pipeline.sync_archive_to_database(past_days=150)
+                    load_verified_scorecard_df.clear()
                     st.success(
                         f"Synced {synced['forecast_runs']:,} forecast runs and {synced['verification_outcomes']:,} verification rows."
                     )

@@ -14,7 +14,7 @@ This module is responsible for:
 4. Exporting a clean dataset ('processed_weather_data.csv') ready for ML training & SHAP explainability.
 """
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 import math
 import time
 from pathlib import Path
@@ -222,6 +222,74 @@ def sync_archive_to_database(past_days: int = 150) -> Dict[str, int]:
     """Fetch paired historical multi-horizon (Day+1/3/5/7) forecasts vs Day-0 actuals and persist to DB."""
     df_meta = fetch_open_meteo_archive_data(past_days=past_days, include_metadata=True)
     return persist_archive_df_to_db(df_meta)
+
+
+def fetch_recent_day0_observations(past_days: int = 14) -> List[Dict[str, object]]:
+    """Fetch recent complete IST Day-0 observations across all 18 synoptic stations."""
+    ist_today = datetime.now(timezone(timedelta(hours=5, minutes=30))).date().isoformat()
+    obs_rows: List[Dict[str, object]] = []
+
+    for chunk_start in range(0, len(INDIA_ARCHIVE_STATIONS), 6):
+        batch = INDIA_ARCHIVE_STATIONS[chunk_start : chunk_start + 6]
+        params = {
+            "latitude": ",".join(f"{s[1]:.4f}" for s in batch),
+            "longitude": ",".join(f"{s[2]:.4f}" for s in batch),
+            "hourly": "temperature_2m,precipitation",
+            "models": "ecmwf_ifs025",
+            "past_days": int(past_days),
+            "forecast_days": 0,
+            "timezone": "Asia/Kolkata",
+        }
+        resp = requests.get(PREVIOUS_RUNS_URL, params=params, timeout=30)
+        resp.raise_for_status()
+        payload = resp.json()
+        if isinstance(payload, dict):
+            payload = [payload]
+
+        for (station_name, _lat, _lon), loc in zip(batch, payload):
+            hourly = loc.get("hourly", {})
+            times = hourly.get("time", [])
+            t_arr = _first_nonempty_series(hourly, "temperature_2m_ecmwf_ifs025", "temperature_2m")
+            r_arr = _first_nonempty_series(hourly, "precipitation_ecmwf_ifs025", "precipitation")
+            if not (times and t_arr and r_arr):
+                continue
+
+            n_days = len(times) // 24
+            for day_idx in range(n_days):
+                s = day_idx * 24
+                e = (day_idx + 1) * 24
+                obs_date = str(times[s])[:10]
+                if obs_date >= ist_today:
+                    continue
+                t_day = [float(x) for x in t_arr[s:e] if x is not None]
+                r_day = [float(x) for x in r_arr[s:e] if x is not None]
+                if len(t_day) < 18 or len(r_day) < 18:
+                    continue
+                obs_rows.append({
+                    "station_name": station_name,
+                    "obs_date": obs_date,
+                    "actual_temp": round(max(t_day), 2),
+                    "actual_rainfall": round(sum(r_day), 2),
+                })
+
+    return obs_rows
+
+
+def sync_recent_observations_to_db(past_days: int = 14) -> Dict[str, object]:
+    """Fetch recent Day-0 observed actuals and persist into `verification_outcomes`."""
+    from db import upsert_verification_outcomes
+
+    obs_rows = fetch_recent_day0_observations(past_days=past_days)
+    if not obs_rows:
+        return {"observation_rows": 0, "dates_covered": 0, "latest_obs_date": None}
+
+    n_upserted = upsert_verification_outcomes(obs_rows, source="open_meteo_day0")
+    dates = sorted({str(r["obs_date"]) for r in obs_rows})
+    return {
+        "observation_rows": int(n_upserted),
+        "dates_covered": len(dates),
+        "latest_obs_date": dates[-1] if dates else None,
+    }
 
 
 def generate_synthetic_weather_data(

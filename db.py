@@ -614,6 +614,55 @@ def get_database_summary(engine: Optional[Engine] = None) -> Dict[str, Any]:
     }
 
 
+def get_pending_verification_summary(engine: Optional[Engine] = None) -> Dict[str, Any]:
+    """Inspect verified coverage and count past-valid forecast snapshots awaiting Day-0 actuals."""
+    eng = init_db(engine)
+    today_utc = datetime.now(timezone.utc).date()
+
+    with eng.connect() as conn:
+        pending_past_pairs = (
+            conn.execute(
+                text(
+                    """
+                    SELECT COUNT(*) FROM forecast_runs f
+                    LEFT JOIN verification_outcomes v
+                      ON f.station_id = v.station_id
+                     AND f.valid_date = v.obs_date
+                    WHERE v.verification_id IS NULL
+                      AND f.valid_date <= :cutoff_date
+                    """
+                ),
+                {"cutoff_date": today_utc},
+            ).scalar()
+            or 0
+        )
+        live_forward_runs = (
+            conn.execute(
+                text("SELECT COUNT(*) FROM forecast_runs WHERE nwp_model != 'open_meteo_multihorizon'")
+            ).scalar()
+            or 0
+        )
+        live_verified_pairs = (
+            conn.execute(
+                text("SELECT COUNT(*) FROM v_verified_forecasts WHERE nwp_model != 'open_meteo_multihorizon'")
+            ).scalar()
+            or 0
+        )
+        date_bounds = conn.execute(
+            text("SELECT MIN(valid_date), MAX(valid_date) FROM v_verified_forecasts")
+        ).first()
+
+    min_d = str(date_bounds[0]) if date_bounds and date_bounds[0] is not None else None
+    max_d = str(date_bounds[1]) if date_bounds and date_bounds[1] is not None else None
+    return {
+        "pending_past_pairs": int(pending_past_pairs),
+        "live_forward_runs": int(live_forward_runs),
+        "live_verified_pairs": int(live_verified_pairs),
+        "min_verified_date": min_d,
+        "max_verified_date": max_d,
+    }
+
+
 def bootstrap_database(engine: Optional[Engine] = None) -> Dict[str, Any]:
     """Initialize schema, ensure the 18 synoptic stations exist, and return counts."""
     eng = init_db(engine)
