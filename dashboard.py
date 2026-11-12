@@ -49,6 +49,11 @@ CHART_LABELS: Dict[str, str] = {
     "wind_shear": "Wind Shear",
     "predicted_rainfall": "Forecast Rain",
     "predicted_temp": "Forecast Temp",
+    "lead_day": "Lead Horizon",
+    "relative_humidity": "Rel. Humidity",
+    "cape": "CAPE Instability",
+    "model_temp_spread": "ECMWF-GFS Temp Δ",
+    "model_rain_spread": "ECMWF-GFS Rain Δ",
 }
 
 # Warm earthy palette: Cream (#FEF3E2), Amber (#F4AE52), Terracotta (#D4621A), Espresso (#2A1A0E)
@@ -580,7 +585,7 @@ button[data-baseweb="tab"][aria-selected="true"] {{
 @st.cache_resource(show_spinner=False)
 def load_model_bundle() -> Dict[str, Any]:
     """Load the serialized model and SHAP TreeExplainer once per worker."""
-    target_version = "v2-india-archive-2682"
+    target_version = "v3-multihorizon-spread-10728"
     data_csv = BASE_DIR / "processed_weather_data.csv"
     bundle: Any = None
 
@@ -675,21 +680,78 @@ DRIVER_NOTES = {
         "pos": "Forecasted temperature sits near seasonal extremes where boundary-layer errors widen.",
         "neg": "Temperature remains close to seasonal norms with low model bias.",
     },
+    "lead_day": {
+        "pos": "Extended multi-day forecast lead increases planetary wave and frontal timing drift.",
+        "neg": "Short forecast lead anchors the run closely to recent synoptic assimilation.",
+    },
+    "relative_humidity": {
+        "pos": "High boundary-layer moisture increases convective trigger sensitivity and latent heat uncertainty.",
+        "neg": "Drier boundary-layer air suppresses moist convective surprise.",
+    },
+    "cape": {
+        "pos": "Elevated CAPE signals explosive convective instability where NWP rain timing degrades sharply.",
+        "neg": "Low CAPE indicates stable atmospheric stratification with limited convective surprise.",
+    },
+    "model_temp_spread": {
+        "pos": "Large ECMWF-IFS vs GFS-Seamless temperature divergence reflects competing air-mass boundaries.",
+        "neg": "Strong ECMWF-IFS vs GFS-Seamless temperature agreement confirms high synoptic confidence.",
+    },
+    "model_rain_spread": {
+        "pos": "Wide ECMWF-IFS vs GFS-Seamless precipitation divergence highlights uncertain storm track and intensity.",
+        "neg": "Close inter-model rainfall agreement supports reliable quantitative precipitation guidance.",
+    },
+}
+
+DEFAULT_FEATURE_VALUES: Dict[str, float] = {
+    "predicted_temp": 30.0,
+    "predicted_rainfall": 2.0,
+    "wind_shear": 12.0,
+    "pressure_drop": 1.0,
+    "lead_day": 3.0,
+    "relative_humidity": 65.0,
+    "cape": 250.0,
+    "model_temp_spread": 1.0,
+    "model_rain_spread": 2.0,
 }
 
 
+def _align_feature_frame(df: pd.DataFrame, feature_cols: List[str]) -> pd.DataFrame:
+    """Ensure all model feature columns exist in exact order with safe numeric defaults."""
+    aligned = df.copy()
+    for col in feature_cols:
+        default_val = DEFAULT_FEATURE_VALUES.get(col, 0.0)
+        if col not in aligned.columns:
+            aligned[col] = default_val
+        else:
+            aligned[col] = pd.to_numeric(aligned[col], errors="coerce").fillna(default_val)
+    return aligned[feature_cols].astype(float)
+
+
 def _score_station_rows(rows: List[Dict[str, Any]]) -> pd.DataFrame:
-    """Run one vectorized batch predict_proba pass across all rows."""
+    """Run vectorized batch predict_proba passes across overall + temp/rain heads."""
     df = pd.DataFrame(rows)
     bundle = load_model_bundle()
     feature_cols = bundle["feature_names"]
-    probs = bundle["model"].predict_proba(df[feature_cols].astype(float))[:, 1]
+    X = _align_feature_frame(df, feature_cols)
+    probs = bundle["model"].predict_proba(X)[:, 1]
 
     df["risk_percentage"] = np.round(probs * 100.0, 2)
+    temp_model = bundle.get("temp_model")
+    rain_model = bundle.get("rain_model")
+    df["temp_bust_prob"] = (
+        np.round(temp_model.predict_proba(X)[:, 1] * 100.0, 1)
+        if temp_model is not None
+        else np.nan
+    )
+    df["rain_bust_prob"] = (
+        np.round(rain_model.predict_proba(X)[:, 1] * 100.0, 1)
+        if rain_model is not None
+        else np.nan
+    )
     df["risk_level"] = np.where(
         df["risk_percentage"] >= 75.0, "Critical",
         np.where(df["risk_percentage"] >= 50.0, "Elevated",
-        np.where(df["risk_percentage"] >= 30.0, "Watch", "Low"))
+        np.where(df["risk_percentage"] >= 35.0, "Watch", "Low"))
     )
     return df
 
@@ -703,11 +765,35 @@ def _vector_wind_shear(w10: float, d10: float, w500: float, d500: float) -> floa
     return math.hypot(u500 - u10, v500 - v10)
 
 
+def _first_series(hourly: Dict[str, Any], *keys: str) -> List[Any]:
+    """Return the first non-empty list found across candidate Open-Meteo series keys."""
+    for key in keys:
+        arr = hourly.get(key)
+        if isinstance(arr, list) and arr:
+            return arr
+    return []
+
+
+def _blend_hourly_pair(arr_a: List[Any], arr_b: List[Any]) -> List[Any]:
+    """Element-wise average of two Open-Meteo hourly arrays where both have values."""
+    if not arr_a:
+        return arr_b
+    if not arr_b:
+        return arr_a
+    out: List[Any] = []
+    for a, b in zip(arr_a, arr_b):
+        if a is not None and b is not None:
+            out.append((float(a) + float(b)) / 2.0)
+        else:
+            out.append(a if a is not None else b)
+    return out
+
+
 @st.cache_data(ttl=900, show_spinner=False)
-def _fetch_open_meteo_grid(om_model: str) -> List[Dict[str, Any]]:
+def _fetch_open_meteo_grid() -> List[Dict[str, Any]]:
     """
-    Fetch an 11-day IST forecast batch for all 18 stations in a single GET request.
-    Raises on transient failure so Streamlit does not cache an error response.
+    Fetch an 11-day multi-model (ECMWF-IFS025 + GFS-Seamless) IST forecast batch
+    across all 18 Indian stations in a single GET request.
     """
     lats = ",".join(f"{s['lat']:.4f}" for s in INDIAN_MET_STATIONS)
     lons = ",".join(f"{s['lon']:.4f}" for s in INDIAN_MET_STATIONS)
@@ -716,17 +802,20 @@ def _fetch_open_meteo_grid(om_model: str) -> List[Dict[str, Any]]:
         "longitude": lons,
         "hourly": (
             "temperature_2m,precipitation,pressure_msl,"
-            "wind_speed_10m,wind_direction_10m,wind_speed_500hPa,wind_direction_500hPa"
+            "wind_speed_10m,wind_direction_10m,wind_speed_500hPa,wind_direction_500hPa,"
+            "relative_humidity_2m,cape"
         ),
         "wind_speed_unit": "ms",
         "forecast_days": 11,
         "timezone": "Asia/Kolkata",
-        "models": om_model,
+        "models": "ecmwf_ifs025,gfs_seamless",
     }
-    resp = requests.get(OPEN_METEO_URL, params=params, timeout=10.0)
+    resp = requests.get(OPEN_METEO_URL, params=params, timeout=15.0)
     if resp.status_code != 200:
         raise RuntimeError(f"Open-Meteo returned HTTP {resp.status_code}")
     payload = resp.json()
+    if isinstance(payload, dict):
+        payload = [payload]
     if not isinstance(payload, list) or len(payload) != len(INDIAN_MET_STATIONS):
         raise RuntimeError("Unexpected Open-Meteo multi-location payload shape")
     return payload
@@ -734,8 +823,8 @@ def _fetch_open_meteo_grid(om_model: str) -> List[Dict[str, Any]]:
 
 @st.cache_data(ttl=900, show_spinner=False)
 def _build_live_horizon_df(om_model: str) -> pd.DataFrame:
-    """Transform 11-day Open-Meteo hourly series into 18x10 Day+1..Day+10 ML features."""
-    payload = _fetch_open_meteo_grid(om_model)
+    """Transform 11-day multi-model Open-Meteo hourly series into 18x10 ML features + ECMWF/GFS spread."""
+    payload = _fetch_open_meteo_grid()
     rows: List[Dict[str, Any]] = []
     elevations: Dict[str, float] = {}
 
@@ -744,13 +833,48 @@ def _build_live_horizon_df(om_model: str) -> pd.DataFrame:
             elevations[station["name"]] = float(loc_data["elevation"])
         hourly = loc_data.get("hourly", {})
         times = hourly.get("time", [])
-        temps = hourly.get("temperature_2m", [])
-        rains = hourly.get("precipitation", [])
-        press = hourly.get("pressure_msl", [])
-        w10_arr = hourly.get("wind_speed_10m", [])
-        d10_arr = hourly.get("wind_direction_10m", [])
-        w5_arr = hourly.get("wind_speed_500hPa", [])
-        d5_arr = hourly.get("wind_direction_500hPa", [])
+
+        ec_t_arr = _first_series(hourly, "temperature_2m_ecmwf_ifs025", "temperature_2m")
+        gf_t_arr = _first_series(hourly, "temperature_2m_gfs_seamless", "temperature_2m")
+        ec_r_arr = _first_series(hourly, "precipitation_ecmwf_ifs025", "precipitation")
+        gf_r_arr = _first_series(hourly, "precipitation_gfs_seamless", "precipitation")
+
+        if om_model == "gfs_seamless":
+            temps = gf_t_arr or ec_t_arr
+            rains = gf_r_arr or ec_r_arr
+            press = _first_series(hourly, "pressure_msl_gfs_seamless", "pressure_msl_ecmwf_ifs025", "pressure_msl")
+            w10_arr = _first_series(hourly, "wind_speed_10m_gfs_seamless", "wind_speed_10m_ecmwf_ifs025", "wind_speed_10m")
+            d10_arr = _first_series(hourly, "wind_direction_10m_gfs_seamless", "wind_direction_10m_ecmwf_ifs025", "wind_direction_10m")
+            w5_arr = _first_series(hourly, "wind_speed_500hPa_gfs_seamless", "wind_speed_500hPa_ecmwf_ifs025", "wind_speed_500hPa")
+            d5_arr = _first_series(hourly, "wind_direction_500hPa_gfs_seamless", "wind_direction_500hPa_ecmwf_ifs025", "wind_direction_500hPa")
+            rh_arr = _first_series(hourly, "relative_humidity_2m_gfs_seamless", "relative_humidity_2m_ecmwf_ifs025", "relative_humidity_2m")
+        elif om_model == "best_match":
+            temps = _blend_hourly_pair(ec_t_arr, gf_t_arr)
+            rains = _blend_hourly_pair(ec_r_arr, gf_r_arr)
+            press = _blend_hourly_pair(
+                _first_series(hourly, "pressure_msl_ecmwf_ifs025", "pressure_msl"),
+                _first_series(hourly, "pressure_msl_gfs_seamless", "pressure_msl"),
+            )
+            w10_arr = _first_series(hourly, "wind_speed_10m_ecmwf_ifs025", "wind_speed_10m_gfs_seamless", "wind_speed_10m")
+            d10_arr = _first_series(hourly, "wind_direction_10m_ecmwf_ifs025", "wind_direction_10m_gfs_seamless", "wind_direction_10m")
+            w5_arr = _first_series(hourly, "wind_speed_500hPa_ecmwf_ifs025", "wind_speed_500hPa_gfs_seamless", "wind_speed_500hPa")
+            d5_arr = _first_series(hourly, "wind_direction_500hPa_ecmwf_ifs025", "wind_direction_500hPa_gfs_seamless", "wind_direction_500hPa")
+            rh_arr = _blend_hourly_pair(
+                _first_series(hourly, "relative_humidity_2m_ecmwf_ifs025", "relative_humidity_2m"),
+                _first_series(hourly, "relative_humidity_2m_gfs_seamless", "relative_humidity_2m"),
+            )
+        else:
+            temps = ec_t_arr or gf_t_arr
+            rains = ec_r_arr or gf_r_arr
+            press = _first_series(hourly, "pressure_msl_ecmwf_ifs025", "pressure_msl_gfs_seamless", "pressure_msl")
+            w10_arr = _first_series(hourly, "wind_speed_10m_ecmwf_ifs025", "wind_speed_10m_gfs_seamless", "wind_speed_10m")
+            d10_arr = _first_series(hourly, "wind_direction_10m_ecmwf_ifs025", "wind_direction_10m_gfs_seamless", "wind_direction_10m")
+            w5_arr = _first_series(hourly, "wind_speed_500hPa_ecmwf_ifs025", "wind_speed_500hPa_gfs_seamless", "wind_speed_500hPa")
+            d5_arr = _first_series(hourly, "wind_direction_500hPa_ecmwf_ifs025", "wind_direction_500hPa_gfs_seamless", "wind_direction_500hPa")
+            rh_arr = _first_series(hourly, "relative_humidity_2m_ecmwf_ifs025", "relative_humidity_2m_gfs_seamless", "relative_humidity_2m")
+
+        # Keep GFS CAPE primary to stay distribution-aligned with Open-Meteo archive training data
+        cape_arr = _first_series(hourly, "cape_gfs_seamless", "cape_ecmwf_ifs025", "cape")
 
         for lead_day in range(1, 11):
             start = lead_day * 24
@@ -760,12 +884,18 @@ def _build_live_horizon_df(om_model: str) -> pd.DataFrame:
 
             day_temps = [float(x) for x in temps[start:end] if x is not None]
             day_rains = [float(x) for x in rains[start:end] if x is not None]
+            ec_t_day = [float(x) for x in ec_t_arr[start:end] if x is not None]
+            gf_t_day = [float(x) for x in gf_t_arr[start:end] if x is not None]
+            ec_r_day = [float(x) for x in ec_r_arr[start:end] if x is not None]
+            gf_r_day = [float(x) for x in gf_r_arr[start:end] if x is not None]
+            rh_day = [float(x) for x in rh_arr[start:end] if x is not None]
+            cape_day = [float(x) for x in cape_arr[start:end] if x is not None]
 
             # Same-hour 24h pressure tendency removes the ~4 hPa tropical diurnal tide
             drops_24h = [
                 float(press[idx - 24]) - float(press[idx])
                 for idx in range(start, end)
-                if press[idx - 24] is not None and press[idx] is not None
+                if idx < len(press) and press[idx - 24] is not None and press[idx] is not None
             ]
             shears = [
                 _vector_wind_shear(
@@ -775,13 +905,18 @@ def _build_live_horizon_df(om_model: str) -> pd.DataFrame:
                     float(d5_arr[idx]),
                 )
                 for idx in range(start, end)
-                if None not in (w10_arr[idx], d10_arr[idx], w5_arr[idx], d5_arr[idx])
+                if idx < len(w10_arr) and idx < len(d10_arr) and idx < len(w5_arr) and idx < len(d5_arr)
+                and None not in (w10_arr[idx], d10_arr[idx], w5_arr[idx], d5_arr[idx])
             ]
 
             pred_temp = max(day_temps) if day_temps else station["base_temp"]
             pred_rain = sum(day_rains) if day_rains else 0.0
             p_drop = max([0.5] + drops_24h)
             shear_85 = float(np.percentile(shears, 85)) if shears else 12.0
+            rh_mean = float(np.mean(rh_day)) if rh_day else 65.0
+            cape_max = max(cape_day) if cape_day else 0.0
+            t_spread = abs(max(ec_t_day) - max(gf_t_day)) if (ec_t_day and gf_t_day) else 0.8
+            r_spread = abs(sum(ec_r_day) - sum(gf_r_day)) if (ec_r_day and gf_r_day) else 1.0
 
             rows.append({
                 "lead_day": lead_day,
@@ -795,6 +930,10 @@ def _build_live_horizon_df(om_model: str) -> pd.DataFrame:
                 "predicted_rainfall": round(max(0.0, pred_rain), 1),
                 "wind_shear": round(float(np.clip(shear_85, 4.0, 50.0)), 2),
                 "pressure_drop": round(float(np.clip(p_drop, 0.5, 30.0)), 2),
+                "relative_humidity": round(float(np.clip(rh_mean, 5.0, 100.0)), 1),
+                "cape": round(float(np.clip(cape_max, 0.0, 5000.0)), 0),
+                "model_temp_spread": round(t_spread, 2),
+                "model_rain_spread": round(r_spread, 2),
             })
 
     scored_df = _score_station_rows(rows)
@@ -809,7 +948,7 @@ def _build_live_horizon_df(om_model: str) -> pd.DataFrame:
             scored_df.to_dict(orient="records"),
             nwp_model=om_model,
             issued_date=ist_today,
-            model_version=str(bundle_meta.get("pipeline_version", "v2-india-archive-2682")),
+            model_version=str(bundle_meta.get("pipeline_version", "v3-multihorizon-spread-10728")),
         )
     except Exception:
         pass
@@ -838,14 +977,26 @@ def _build_sim_horizon_df(nwp_model: str, seed: int = 101) -> pd.DataFrame:
                 pressure_drop = float(rng.uniform(14.0, 24.0) * (lead_day / 5.0) * sim_scale)
                 wind_shear = float(rng.uniform(28.0, 44.0) * sim_scale)
                 predicted_rain = float(rng.uniform(22.0, 52.0) * lead_dispersion)
+                rel_hum = float(rng.uniform(82.0, 96.0))
+                cape_val = float(rng.uniform(1350.0, 2600.0) * sim_scale)
+                t_spread = float(rng.uniform(1.8, 3.8) * (1.0 + (lead_day - 3) * 0.08))
+                r_spread = float(rng.uniform(14.0, 34.0) * (1.0 + (lead_day - 3) * 0.10))
             elif is_himalayan and lead_day >= 4:
                 pressure_drop = float(rng.uniform(10.0, 19.0) * sim_scale)
                 wind_shear = float(rng.uniform(32.0, 48.0) * sim_scale)
                 predicted_rain = float(rng.uniform(8.0, 26.0) * sim_scale)
+                rel_hum = float(rng.uniform(68.0, 88.0))
+                cape_val = float(rng.uniform(450.0, 1100.0))
+                t_spread = float(rng.uniform(2.2, 4.4) * (1.0 + (lead_day - 4) * 0.07))
+                r_spread = float(rng.uniform(8.0, 22.0))
             else:
                 pressure_drop = float(rng.gamma(shape=2.0, scale=3.0) * (1.0 + lead_day * 0.08) * sim_scale)
                 wind_shear = float(rng.normal(loc=16.0, scale=7.0) * sim_scale)
                 predicted_rain = float(rng.exponential(scale=6.0) * sim_scale if rng.random() > 0.4 else 0.0)
+                rel_hum = float(rng.uniform(42.0, 76.0))
+                cape_val = float(rng.uniform(80.0, 750.0))
+                t_spread = float(rng.uniform(0.4, 1.9) * (1.0 + lead_day * 0.08))
+                r_spread = float(rng.uniform(0.2, 6.5) * (1.0 + lead_day * 0.10))
 
             rows.append({
                 "lead_day": lead_day,
@@ -859,6 +1010,10 @@ def _build_sim_horizon_df(nwp_model: str, seed: int = 101) -> pd.DataFrame:
                 "predicted_rainfall": round(max(0.0, predicted_rain), 1),
                 "wind_shear": round(float(np.clip(wind_shear, 4.0, 50.0)), 2),
                 "pressure_drop": round(float(np.clip(pressure_drop, 0.5, 28.0)), 2),
+                "relative_humidity": round(float(np.clip(rel_hum, 15.0, 100.0)), 1),
+                "cape": round(float(np.clip(cape_val, 0.0, 4000.0)), 0),
+                "model_temp_spread": round(t_spread, 2),
+                "model_rain_spread": round(r_spread, 2),
             })
 
     return _score_station_rows(rows)
@@ -884,7 +1039,7 @@ def _compute_local_shap(sample_df: pd.DataFrame, top_k: int = 3) -> List[Dict[st
     bundle = load_model_bundle()
     explainer = bundle["explainer"]
     feature_cols = bundle["feature_names"]
-    ordered_df = sample_df[feature_cols].astype(float)
+    ordered_df = _align_feature_frame(sample_df, feature_cols)
 
     raw_shap = explainer.shap_values(ordered_df)
     if isinstance(raw_shap, list):
@@ -923,6 +1078,10 @@ def get_station_shap(
     wind_shear: float,
     pressure_drop: float,
     lead_day: int,
+    relative_humidity: float = 65.0,
+    cape: float = 250.0,
+    model_temp_spread: float = 1.0,
+    model_rain_spread: float = 2.0,
     use_api: bool = False,
     top_k: int = 3,
 ) -> Dict[str, Any]:
@@ -939,7 +1098,12 @@ def get_station_shap(
                 "predicted_rainfall": predicted_rainfall,
                 "wind_shear": wind_shear,
                 "pressure_drop": pressure_drop,
+                "lead_day": lead_day,
                 "lead_time_hours": lead_day * 24,
+                "relative_humidity": relative_humidity,
+                "cape": cape,
+                "model_temp_spread": model_temp_spread,
+                "model_rain_spread": model_rain_spread,
             }
             resp = requests.post(f"{API_BASE_URL}/predict_bust_risk", json=payload, timeout=0.6)
             if resp.status_code == 200:
@@ -956,6 +1120,11 @@ def get_station_shap(
         "predicted_rainfall": predicted_rainfall,
         "wind_shear": wind_shear,
         "pressure_drop": pressure_drop,
+        "lead_day": lead_day,
+        "relative_humidity": relative_humidity,
+        "cape": cape,
+        "model_temp_spread": model_temp_spread,
+        "model_rain_spread": model_rain_spread,
     }])
     return {
         "factors": _compute_local_shap(sample_df, top_k=top_k),
@@ -969,8 +1138,13 @@ def evaluate_custom_scenario(
     predicted_rainfall: float,
     wind_shear: float,
     pressure_drop: float,
+    lead_day: int = 3,
+    relative_humidity: float = 65.0,
+    cape: float = 250.0,
+    model_temp_spread: float = 1.0,
+    model_rain_spread: float = 2.0,
 ) -> Dict[str, Any]:
-    """Predict bust probability and SHAP attribution for interactive What-If inputs."""
+    """Predict calibrated bust probability + temp/rain split + SHAP attribution for What-If inputs."""
     bundle = load_model_bundle()
     feature_cols = bundle["feature_names"]
     sample_df = pd.DataFrame([{
@@ -978,10 +1152,22 @@ def evaluate_custom_scenario(
         "predicted_rainfall": predicted_rainfall,
         "wind_shear": wind_shear,
         "pressure_drop": pressure_drop,
+        "lead_day": lead_day,
+        "relative_humidity": relative_humidity,
+        "cape": cape,
+        "model_temp_spread": model_temp_spread,
+        "model_rain_spread": model_rain_spread,
     }])
-    prob = float(bundle["model"].predict_proba(sample_df[feature_cols].astype(float))[0, 1])
+    X = _align_feature_frame(sample_df, feature_cols)
+    prob = float(bundle["model"].predict_proba(X)[0, 1])
+    temp_model = bundle.get("temp_model")
+    rain_model = bundle.get("rain_model")
+    temp_pct = round(float(temp_model.predict_proba(X)[0, 1]) * 100.0, 1) if temp_model is not None else None
+    rain_pct = round(float(rain_model.predict_proba(X)[0, 1]) * 100.0, 1) if rain_model is not None else None
     return {
         "risk_percentage": round(prob * 100.0, 2),
+        "temp_bust_prob": temp_pct,
+        "rain_bust_prob": rain_pct,
         "factors": _compute_local_shap(sample_df, top_k=3),
     }
 
@@ -1062,7 +1248,9 @@ def build_horizon_figure(
         f"<b>Day +{int(row.lead_day)} ({row.forecast_date})</b><br>"
         f"Bust Risk: <b>{row.risk_percentage:.1f}%</b><br>"
         f"Temp: {row.predicted_temp} °C | Rain: {row.predicted_rainfall} mm<br>"
-        f"Shear: {row.wind_shear} m/s | ΔPress: -{row.pressure_drop} hPa"
+        f"Shear: {row.wind_shear} m/s | ΔPress: -{row.pressure_drop} hPa<br>"
+        f"CAPE: {getattr(row, 'cape', 0.0):.0f} J/kg | "
+        f"ECMWF-GFS Δ: {getattr(row, 'model_temp_spread', 0.0):.1f}°C / {getattr(row, 'model_rain_spread', 0.0):.1f}mm"
         for row in ordered.itertuples()
     ]
 
@@ -1133,22 +1321,55 @@ def render_station_panel(
     shear: float,
     pdrop: float,
     footer_meta: str,
+    temp_bust_pct: Optional[float] = None,
+    rain_bust_pct: Optional[float] = None,
+    spread_t: Optional[float] = None,
+    spread_r: Optional[float] = None,
+    cape: Optional[float] = None,
+    rh: Optional[float] = None,
 ) -> None:
-    """Render shared Station / Scenario diagnostic panel with animated risk gauge."""
+    """Render shared Station / Scenario diagnostic panel with animated risk gauge and param split."""
     if risk_pct >= alert_threshold:
         badge_bg = PALETTE["critical_red"]
         verdict = f"High Bust Risk ({risk_pct:.1f}%)"
         advice = "High chance of >3°C temp or >15mm rain error. Manual forecaster override advised."
-    elif risk_pct >= 50.0:
+    elif risk_pct >= 35.0:
         badge_bg = PALETTE["amber"]
         verdict = f"Elevated Watch ({risk_pct:.1f}%)"
-        advice = "Column stability is marginal. Cross-check against latest satellite and radar loops."
+        advice = "Column stability or multi-model agreement is marginal. Cross-check satellite and radar loops."
     else:
         badge_bg = PALETTE["sage_green"]
         verdict = f"Reliable Forecast ({risk_pct:.1f}%)"
-        advice = "Synoptic inputs lie within well-behaved regimes with low error variance."
+        advice = "Synoptic inputs and multi-model consensus lie within well-behaved regimes."
 
     clamped = min(max(risk_pct, 0.0), 100.0)
+    split_badges = ""
+    if temp_bust_pct is not None and rain_bust_pct is not None and not (pd.isna(temp_bust_pct) or pd.isna(rain_bust_pct)):
+        split_badges = (
+            f'<div class="mono-meta" style="display:flex; flex-wrap:wrap; gap:8px; margin:8px 0 2px 0; font-size:11.5px;">'
+            f'<span style="background:{PALETTE["sand"]}; padding:3px 8px; border-radius:5px; color:{PALETTE["espresso"]};">'
+            f'Temp Bust (&gt;3°C): <strong>{float(temp_bust_pct):.1f}%</strong></span>'
+            f'<span style="background:{PALETTE["sand"]}; padding:3px 8px; border-radius:5px; color:{PALETTE["espresso"]};">'
+            f'Rain Bust (&gt;15mm): <strong>{float(rain_bust_pct):.1f}%</strong></span>'
+            f'</div>'
+        )
+
+    extra_cells = ""
+    if cape is not None and rh is not None:
+        extra_cells += (
+            f'<div class="stat-cell">'
+            f'<div class="stat-cell-label">CAPE / Rel. Humidity</div>'
+            f'<div class="stat-cell-val">{float(cape):.0f} J/kg &middot; {float(rh):.0f}%</div>'
+            f'</div>'
+        )
+    if spread_t is not None and spread_r is not None:
+        extra_cells += (
+            f'<div class="stat-cell">'
+            f'<div class="stat-cell-label">ECMWF-GFS Spread</div>'
+            f'<div class="stat-cell-val">&Delta;{float(spread_t):.1f}°C &middot; &Delta;{float(spread_r):.1f}mm</div>'
+            f'</div>'
+        )
+
     st.markdown(
         f"""
 <div class="station-panel">
@@ -1161,6 +1382,7 @@ def render_station_panel(
 <div class="risk-meter-fill" style="width: {clamped:.1f}%; background: {badge_bg};"></div>
 </div>
 <p style="font-size:13.5px; color:{PALETTE['espresso']}; margin:10px 0 4px 0;">{advice}</p>
+{split_badges}
 <div class="stat-grid">
 <div class="stat-cell">
 <div class="stat-cell-label">Forecast Temp</div>
@@ -1178,6 +1400,7 @@ def render_station_panel(
 <div class="stat-cell-label">Pressure Drop (24h)</div>
 <div class="stat-cell-val">-{pdrop} hPa</div>
 </div>
+{extra_cells}
 </div>
 <div class="mono-meta" style="margin-top:10px; font-size:11px;">{footer_meta}</div>
 </div>
@@ -1243,11 +1466,11 @@ with st.sidebar:
 
     alert_threshold = st.slider(
         "Red Alert Bust Threshold (%)",
-        min_value=50,
+        min_value=40,
         max_value=90,
-        value=70,
+        value=60,
         step=5,
-        help="Stations at or above this risk score are marked red on the map.",
+        help="Stations at or above this calibrated probability are marked red on the map.",
     )
 
     db_summary = ensure_db_initialized()
@@ -1285,9 +1508,9 @@ st.markdown(
 df_stations = horizon_df[horizon_df["lead_day"] == lead_day].reset_index(drop=True)
 active_date = str(df_stations["forecast_date"].iloc[0])
 
-# Alert calculations (explicitly exclude high-risk count from elevated count even if threshold < 50)
+# Alert calculations (explicitly exclude high-risk count from elevated count even if threshold <= 35)
 high_risk_mask = df_stations["risk_percentage"] >= alert_threshold
-elevated_mask = (df_stations["risk_percentage"] >= 50.0) & (~high_risk_mask)
+elevated_mask = (df_stations["risk_percentage"] >= 35.0) & (~high_risk_mask)
 
 high_risk_count = int(high_risk_mask.sum())
 elevated_count = int(elevated_mask.sum())
@@ -1316,7 +1539,7 @@ st.markdown(
     <div class="kpi-sub">Requires forecaster review</div>
   </div>
   <div class="kpi-card" style="border-top: 3px solid {PALETTE['amber']};">
-    <div class="kpi-label">Elevated Watch (50&ndash;{alert_threshold}%)</div>
+    <div class="kpi-label">Elevated Watch (35&ndash;{alert_threshold}%)</div>
     <div class="kpi-value" style="color:{PALETTE['terracotta']};">{elevated_count} Stations</div>
     <div class="kpi-sub">Monitor convective shifts</div>
   </div>
@@ -1343,7 +1566,7 @@ elif elevated_count > 0:
     st.markdown(
         f"""
         <div class="status-banner banner-warn">
-            <strong>Watch Status (Day +{lead_day} &middot; {active_date}):</strong> No stations exceed {alert_threshold}% via <strong>{feed_label}</strong>, though {elevated_count} station(s) sit in the 50&ndash;{alert_threshold}% watch band.
+            <strong>Watch Status (Day +{lead_day} &middot; {active_date}):</strong> No stations exceed {alert_threshold}% via <strong>{feed_label}</strong>, though {elevated_count} station(s) sit in the 35&ndash;{alert_threshold}% watch band.
         </div>
         """,
         unsafe_allow_html=True,
@@ -1352,7 +1575,7 @@ else:
     st.markdown(
         f"""
         <div class="status-banner banner-ok">
-            <strong>Nominal Reliability (Day +{lead_day} &middot; {active_date}):</strong> All {len(df_stations)} stations sit below 50% bust probability via <strong>{feed_label}</strong>.
+            <strong>Nominal Reliability (Day +{lead_day} &middot; {active_date}):</strong> All {len(df_stations)} stations sit below 35% calibrated bust probability via <strong>{feed_label}</strong>.
         </div>
         """,
         unsafe_allow_html=True,
@@ -1365,8 +1588,8 @@ st.markdown(
     f"""
     <div class="map-legend">
         <span class="legend-item"><span class="legend-dot" style="background:{PALETTE['critical_red']};"></span> High-Risk Bust (&ge;{alert_threshold}%)</span>
-        <span class="legend-item"><span class="legend-dot" style="background:{PALETTE['amber']};"></span> Elevated Watch (50&ndash;{alert_threshold}%)</span>
-        <span class="legend-item"><span class="legend-dot" style="background:{PALETTE['sage_green']};"></span> Reliable (&lt;50%)</span>
+        <span class="legend-item"><span class="legend-dot" style="background:{PALETTE['amber']};"></span> Elevated Watch (35&ndash;{alert_threshold}%)</span>
+        <span class="legend-item"><span class="legend-dot" style="background:{PALETTE['sage_green']};"></span> Reliable (&lt;35%)</span>
     </div>
     """,
     unsafe_allow_html=True,
@@ -1393,7 +1616,7 @@ for _, row in df_stations.iterrows():
         marker_color = PALETTE["critical_red"]
         status_text = "High Bust Risk"
         radius = 10
-    elif risk >= 50.0:
+    elif risk >= 35.0:
         marker_color = PALETTE["amber"]
         status_text = "Elevated Watch"
         radius = 8
@@ -1403,7 +1626,7 @@ for _, row in df_stations.iterrows():
         radius = 7
 
     popup_html = f"""
-    <div style="font-family: -apple-system, sans-serif; font-size: 12.5px; width: 225px; background: {PALETTE['cream']}; color: {PALETTE['espresso']}; padding: 8px 10px; border-radius: 6px; border: 1px solid {PALETTE['border']};">
+    <div style="font-family: -apple-system, sans-serif; font-size: 12.5px; width: 235px; background: {PALETTE['cream']}; color: {PALETTE['espresso']}; padding: 8px 10px; border-radius: 6px; border: 1px solid {PALETTE['border']};">
         <div style="font-weight: 700; font-size: 13.5px; color: {PALETTE['espresso']}; margin-bottom: 4px;">{row['station_name']}</div>
         <div style="margin-bottom: 6px;">
             <span style="display:inline-block; background:{marker_color}; color:#FFF9F0; font-size:10px; font-weight:600; padding:2px 7px; border-radius:3px;">{status_text}</span>
@@ -1413,7 +1636,9 @@ for _, row in df_stations.iterrows():
             <b>Forecast Temp:</b> {row['predicted_temp']} °C<br>
             <b>Forecast Rain:</b> {row['predicted_rainfall']} mm<br>
             <b>24h Pressure Drop:</b> {row['pressure_drop']} hPa<br>
-            <b>0-6km Wind Shear:</b> {row['wind_shear']} m/s
+            <b>0-6km Wind Shear:</b> {row['wind_shear']} m/s<br>
+            <b>CAPE / RH:</b> {float(row.get('cape', 0.0)):.0f} J/kg · {float(row.get('relative_humidity', 65.0)):.0f}%<br>
+            <b>ECMWF-GFS Δ:</b> {float(row.get('model_temp_spread', 0.0)):.1f}°C · {float(row.get('model_rain_spread', 0.0)):.1f}mm
         </div>
     </div>
     """
@@ -1466,6 +1691,12 @@ with tab_diag:
     sel = df_stations[df_stations["station_name"] == selected_name].iloc[0]
     sel_risk = float(sel["risk_percentage"])
     sel_short = selected_name.split(" (")[0]
+    sel_rh = float(sel.get("relative_humidity", 65.0))
+    sel_cape = float(sel.get("cape", 250.0))
+    sel_tspread = float(sel.get("model_temp_spread", 1.0))
+    sel_rspread = float(sel.get("model_rain_spread", 2.0))
+    sel_tbust = float(sel["temp_bust_prob"]) if pd.notna(sel.get("temp_bust_prob")) else None
+    sel_rbust = float(sel["rain_bust_prob"]) if pd.notna(sel.get("rain_bust_prob")) else None
 
     shap_result = get_station_shap(
         lat=float(sel["lat"]),
@@ -1475,6 +1706,10 @@ with tab_diag:
         wind_shear=float(sel["wind_shear"]),
         pressure_drop=float(sel["pressure_drop"]),
         lead_day=lead_day,
+        relative_humidity=sel_rh,
+        cape=sel_cape,
+        model_temp_spread=sel_tspread,
+        model_rain_spread=sel_rspread,
         use_api=api_live,
         top_k=3,
     )
@@ -1492,6 +1727,12 @@ with tab_diag:
             shear=sel["wind_shear"],
             pdrop=sel["pressure_drop"],
             footer_meta=f"Day +{lead_day} ({active_date}, {lead_day * 24}h) &middot; {shap_result['source']}",
+            temp_bust_pct=sel_tbust,
+            rain_bust_pct=sel_rbust,
+            spread_t=sel_tspread,
+            spread_r=sel_rspread,
+            cape=sel_cape,
+            rh=sel_rh,
         )
 
     with col_chart:
@@ -1505,54 +1746,105 @@ with tab_diag:
     st.plotly_chart(horizon_fig, width="stretch", config={"displayModeBar": False})
 
 with tab_whatif:
-    st.caption("Stress-test extreme weather inputs live to observe how baroclinic instability drives bust risk and SHAP explanations.")
+    st.caption("Stress-test extreme synoptic dynamics, CAPE, and ECMWF–GFS model disagreement live.")
 
     st.session_state.setdefault("whatif_temp", 31.0)
     st.session_state.setdefault("whatif_rain", 12.0)
     st.session_state.setdefault("whatif_shear", 18.0)
     st.session_state.setdefault("whatif_pdrop", 6.0)
+    st.session_state.setdefault("whatif_lead", 3)
+    st.session_state.setdefault("whatif_rh", 68.0)
+    st.session_state.setdefault("whatif_cape", 350.0)
+    st.session_state.setdefault("whatif_tspread", 1.2)
+    st.session_state.setdefault("whatif_rspread", 4.0)
 
-    def _set_whatif_preset(temp_val: float, rain_val: float, shear_val: float, pdrop_val: float) -> None:
+    def _set_whatif_preset(
+        temp_val: float,
+        rain_val: float,
+        shear_val: float,
+        pdrop_val: float,
+        lead_val: int,
+        rh_val: float,
+        cape_val: float,
+        tspread_val: float,
+        rspread_val: float,
+    ) -> None:
         st.session_state["whatif_temp"] = temp_val
         st.session_state["whatif_rain"] = rain_val
         st.session_state["whatif_shear"] = shear_val
         st.session_state["whatif_pdrop"] = pdrop_val
+        st.session_state["whatif_lead"] = lead_val
+        st.session_state["whatif_rh"] = rh_val
+        st.session_state["whatif_cape"] = cape_val
+        st.session_state["whatif_tspread"] = tspread_val
+        st.session_state["whatif_rspread"] = rspread_val
 
     p_col1, p_col2, p_col3 = st.columns(3)
     with p_col1:
-        st.button("Preset: Calm Clear Day", width="stretch", on_click=_set_whatif_preset, args=(28.5, 0.0, 9.0, 2.0))
+        st.button(
+            "Preset: Calm Clear Day",
+            width="stretch",
+            on_click=_set_whatif_preset,
+            args=(28.5, 0.0, 9.0, 2.0, 2, 48.0, 120.0, 0.5, 0.5),
+        )
     with p_col2:
-        st.button("Preset: Western Disturbance", width="stretch", on_click=_set_whatif_preset, args=(19.0, 26.0, 36.0, 14.5))
+        st.button(
+            "Preset: Western Disturbance",
+            width="stretch",
+            on_click=_set_whatif_preset,
+            args=(19.0, 26.0, 36.0, 14.5, 5, 82.0, 750.0, 2.8, 16.0),
+        )
     with p_col3:
-        st.button("Preset: Coastal Cyclone", width="stretch", on_click=_set_whatif_preset, args=(33.5, 68.0, 44.0, 23.0))
+        st.button(
+            "Preset: Coastal Cyclone",
+            width="stretch",
+            on_click=_set_whatif_preset,
+            args=(33.5, 68.0, 44.0, 23.0, 5, 92.0, 2200.0, 3.6, 28.0),
+        )
 
+    sim_lead = st.slider("Forecast Lead Horizon (Day)", min_value=1, max_value=10, step=1, key="whatif_lead")
     in_col1, in_col2 = st.columns(2)
     with in_col1:
         sim_temp = st.slider("Predicted Temperature (°C)", min_value=2.0, max_value=45.0, step=0.5, key="whatif_temp")
         sim_rain = st.slider("24h Forecast Rainfall (mm)", min_value=0.0, max_value=140.0, step=1.0, key="whatif_rain")
+        sim_rh = st.slider("Relative Humidity (%)", min_value=10.0, max_value=100.0, step=1.0, key="whatif_rh")
+        sim_tspread = st.slider("ECMWF–GFS Temp Spread (°C)", min_value=0.0, max_value=8.0, step=0.1, key="whatif_tspread")
     with in_col2:
         sim_shear = st.slider("0–6km Wind Shear (m/s)", min_value=2.0, max_value=50.0, step=0.5, key="whatif_shear")
         sim_pdrop = st.slider("24h Pressure Drop (hPa)", min_value=0.0, max_value=32.0, step=0.5, key="whatif_pdrop")
+        sim_cape = st.slider("CAPE Instability (J/kg)", min_value=0.0, max_value=4000.0, step=50.0, key="whatif_cape")
+        sim_rspread = st.slider("ECMWF–GFS Rain Spread (mm)", min_value=0.0, max_value=60.0, step=0.5, key="whatif_rspread")
 
     custom_res = evaluate_custom_scenario(
         predicted_temp=float(sim_temp),
         predicted_rainfall=float(sim_rain),
         wind_shear=float(sim_shear),
         pressure_drop=float(sim_pdrop),
+        lead_day=int(sim_lead),
+        relative_humidity=float(sim_rh),
+        cape=float(sim_cape),
+        model_temp_spread=float(sim_tspread),
+        model_rain_spread=float(sim_rspread),
     )
 
     sim_col_info, sim_col_chart = st.columns([1, 1.35])
     with sim_col_info:
         render_station_panel(
             title="Custom Stress Scenario",
-            meta_line=f"Interactive Synthetic Profile &middot; Threshold {alert_threshold}%",
+            meta_line=f"Day +{int(sim_lead)} Synthetic Profile &middot; Threshold {alert_threshold}%",
             risk_pct=custom_res["risk_percentage"],
             alert_threshold=alert_threshold,
             temp=round(float(sim_temp), 1),
             rainfall=round(float(sim_rain), 1),
             shear=round(float(sim_shear), 2),
             pdrop=round(float(sim_pdrop), 2),
-            footer_meta="Evaluated live via serialized ML + SHAP TreeExplainer",
+            footer_meta="Evaluated live via calibrated multi-horizon ML + SHAP TreeExplainer",
+            temp_bust_pct=custom_res.get("temp_bust_prob"),
+            rain_bust_pct=custom_res.get("rain_bust_prob"),
+            spread_t=float(sim_tspread),
+            spread_r=float(sim_rspread),
+            cape=float(sim_cape),
+            rh=float(sim_rh),
         )
     with sim_col_chart:
         sim_fig = build_shap_figure(custom_res["factors"], "SHAP Drivers — Custom Scenario")
@@ -1562,28 +1854,36 @@ with tab_whatif:
 
 with tab_bulletin:
     sorted_df = df_stations.sort_values(by="risk_percentage", ascending=False).reset_index(drop=True)
-    export_df = sorted_df[
-        [
+    export_cols = [
+        c for c in [
             "forecast_date",
             "lead_day",
             "station_name",
             "state",
             "zone",
             "risk_percentage",
+            "temp_bust_prob",
+            "rain_bust_prob",
             "risk_level",
             "predicted_temp",
             "predicted_rainfall",
             "pressure_drop",
             "wind_shear",
+            "cape",
+            "relative_humidity",
+            "model_temp_spread",
+            "model_rain_spread",
         ]
+        if c in sorted_df.columns
     ]
+    export_df = sorted_df[export_cols]
     csv_bytes = export_df.to_csv(index=False).encode("utf-8")
 
     b_col1, b_col2 = st.columns([2, 1])
     with b_col1:
         st.caption(
             f"Sorted highest-to-lowest bust risk for **Day +{lead_day}** ({active_date}) via **{feed_label}**. "
-            "Swipe horizontally on compact screens to view all synoptic metrics."
+            "Swipe horizontally on compact screens to view ensemble spread & instability metrics."
         )
     with b_col2:
         st.download_button(
@@ -1594,18 +1894,25 @@ with tab_bulletin:
             width="stretch",
         )
 
-    table_df = sorted_df[
-        [
+    table_cols = [
+        c for c in [
             "station_name",
             "zone",
             "risk_percentage",
+            "temp_bust_prob",
+            "rain_bust_prob",
             "risk_level",
             "predicted_temp",
             "predicted_rainfall",
             "pressure_drop",
             "wind_shear",
+            "cape",
+            "model_temp_spread",
+            "model_rain_spread",
         ]
+        if c in sorted_df.columns
     ]
+    table_df = sorted_df[table_cols]
     st.dataframe(
         table_df,
         width="stretch",
@@ -1614,11 +1921,16 @@ with tab_bulletin:
             "station_name": st.column_config.TextColumn("Station", width="medium"),
             "zone": st.column_config.TextColumn("Zone", width="small"),
             "risk_percentage": st.column_config.NumberColumn("Risk", format="%.1f%%", width="small"),
+            "temp_bust_prob": st.column_config.NumberColumn("Temp Bust", format="%.1f%%", width="small"),
+            "rain_bust_prob": st.column_config.NumberColumn("Rain Bust", format="%.1f%%", width="small"),
             "risk_level": st.column_config.TextColumn("Tier", width="small"),
             "predicted_temp": st.column_config.NumberColumn("Temp", format="%.1f °C", width="small"),
             "predicted_rainfall": st.column_config.NumberColumn("Rain", format="%.1f mm", width="small"),
             "pressure_drop": st.column_config.NumberColumn("ΔPress", format="%.1f hPa", width="small"),
             "wind_shear": st.column_config.NumberColumn("Shear", format="%.1f m/s", width="small"),
+            "cape": st.column_config.NumberColumn("CAPE", format="%.0f J/kg", width="small"),
+            "model_temp_spread": st.column_config.NumberColumn("ECMWF-GFS ΔT", format="%.1f °C", width="small"),
+            "model_rain_spread": st.column_config.NumberColumn("ECMWF-GFS ΔR", format="%.1f mm", width="small"),
         },
     )
 
@@ -1628,8 +1940,12 @@ with tab_bulletin:
     champion_name = str(bundle_meta.get("champion_name", "RandomForest"))
     metrics = bundle_meta.get("metrics", {}) if isinstance(bundle_meta.get("metrics"), dict) else {}
     roc_auc = metrics.get("roc_auc")
+    brier_val = metrics.get("brier_score")
     f1_val = metrics.get("f1")
     recall_val = metrics.get("recall")
+    cal_method = str(bundle_meta.get("calibration") or metrics.get("calibration") or "none")
+    val_scheme = str(bundle_meta.get("validation_scheme") or metrics.get("validation_scheme") or "holdout")
+    test_range = bundle_meta.get("test_date_range")
 
     training_source = str(bundle_meta.get("training_source", "Historical NWP Benchmark Dataset"))
     sample_count = bundle_meta.get("sample_count")
@@ -1641,20 +1957,31 @@ with tab_bulletin:
         dataset_badge_parts.append(f"Records: **{int(sample_count):,}**")
     if bust_rate is not None:
         dataset_badge_parts.append(f"Observed Bust Rate: **{float(bust_rate) * 100:.1f}%**")
+    if test_range and test_range != "n/a":
+        dataset_badge_parts.append(f"Hold-Out Window: **{test_range}**")
     st.caption(" · ".join(dataset_badge_parts))
 
     roc_txt = f"{float(roc_auc):.3f}" if roc_auc is not None else "N/A"
+    brier_txt = f"{float(brier_val):.4f}" if brier_val is not None else "N/A"
     f1_txt = f"{float(f1_val):.3f}" if f1_val is not None else "N/A"
     recall_txt = f"{float(recall_val):.3f}" if recall_val is not None else "N/A"
+    cal_tag = f"Calibrated ({cal_method})" if cal_method != "none" else "Uncalibrated"
     classifier_sub = (
-        f"{int(sample_count):,} records ({pipeline_ver})"
+        f"{int(sample_count):,} records · {pipeline_ver}"
         if sample_count is not None and pipeline_ver
         else "Serialized in bust_model.pkl"
     )
     auc_sub = (
-        f"Real archive ({float(bust_rate) * 100:.1f}% bust rate)"
+        f"{val_scheme.replace('_', ' ')} ({float(bust_rate) * 100:.1f}% bust)"
         if bust_rate is not None
-        else "Imbalance-weighted training"
+        else val_scheme.replace("_", " ")
+    )
+    t_head_auc = metrics.get("temp_head_auc")
+    r_head_auc = metrics.get("rain_head_auc")
+    brier_sub = (
+        f"Temp AUC {float(t_head_auc):.2f} · Rain AUC {float(r_head_auc):.2f}"
+        if t_head_auc is not None and r_head_auc is not None
+        else cal_tag
     )
 
     st.markdown(
@@ -1662,23 +1989,23 @@ with tab_bulletin:
 <div class="kpi-grid" style="margin-top:8px;">
   <div class="kpi-card" style="border-top: 3px solid {PALETTE['espresso']};">
     <div class="kpi-label">Active Classifier</div>
-    <div class="kpi-value" style="color:{PALETTE['espresso']}; font-size:1.1rem;">{champion_name}</div>
+    <div class="kpi-value" style="color:{PALETTE['espresso']}; font-size:1.08rem;">{champion_name}</div>
     <div class="kpi-sub">{classifier_sub}</div>
   </div>
   <div class="kpi-card" style="border-top: 3px solid {PALETTE['terracotta']};">
-    <div class="kpi-label">Hold-Out ROC-AUC</div>
+    <div class="kpi-label">Chronological ROC-AUC</div>
     <div class="kpi-value" style="color:{PALETTE['terracotta']};">{roc_txt}</div>
     <div class="kpi-sub">{auc_sub}</div>
   </div>
   <div class="kpi-card" style="border-top: 3px solid {PALETTE['amber']};">
-    <div class="kpi-label">Validation F1</div>
-    <div class="kpi-value" style="color:{PALETTE['espresso']};">{f1_txt}</div>
-    <div class="kpi-sub">Test partition score</div>
+    <div class="kpi-label">Brier Score ({cal_method})</div>
+    <div class="kpi-value" style="color:{PALETTE['espresso']};">{brier_txt}</div>
+    <div class="kpi-sub">{brier_sub}</div>
   </div>
   <div class="kpi-card" style="border-top: 3px solid {PALETTE['sage_green']};">
-    <div class="kpi-label">Bust Recall</div>
-    <div class="kpi-value" style="color:{PALETTE['sage_green']};">{recall_txt}</div>
-    <div class="kpi-sub">Severe failure capture rate</div>
+    <div class="kpi-label">Validation F1 &middot; Recall</div>
+    <div class="kpi-value" style="color:{PALETTE['sage_green']};">{f1_txt} / {recall_txt}</div>
+    <div class="kpi-sub">Chronological hold-out threshold 0.50</div>
   </div>
 </div>
 """,
@@ -1726,7 +2053,7 @@ with tab_bulletin:
             paper_bgcolor=PALETTE["surface"],
             plot_bgcolor=PALETTE["cream"],
             margin=dict(l=10, r=20, t=44, b=34),
-            height=245,
+            height=max(260, 44 + 28 * len(g_labels)),
         )
         st.plotly_chart(g_fig, width="stretch", config={"displayModeBar": False})
 

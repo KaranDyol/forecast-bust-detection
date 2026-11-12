@@ -13,14 +13,17 @@ This module:
 """
 
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 import json
 import joblib
 import numpy as np
 import pandas as pd
+from sklearn.base import clone
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import RandomForestClassifier, VotingClassifier
 from sklearn.metrics import (
     accuracy_score,
+    brier_score_loss,
     classification_report,
     f1_score,
     precision_score,
@@ -40,12 +43,90 @@ OPERATIONAL_FEATURES = [
     "predicted_rainfall",
     "wind_shear",
     "pressure_drop",
+    "lead_day",
+    "relative_humidity",
+    "cape",
+    "model_temp_spread",
+    "model_rain_spread",
 ]
+DEFAULT_FEATURE_VALUES: Dict[str, float] = {
+    "predicted_temp": 30.0,
+    "predicted_rainfall": 2.0,
+    "wind_shear": 12.0,
+    "pressure_drop": 1.0,
+    "lead_day": 3.0,
+    "relative_humidity": 65.0,
+    "cape": 250.0,
+    "model_temp_spread": 1.0,
+    "model_rain_spread": 2.0,
+}
 TARGET_COL = "is_bust"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_PATH = BASE_DIR / "processed_weather_data.csv"
 MODEL_PATH = BASE_DIR / "bust_model.pkl"
-PIPELINE_VERSION = "v2-india-archive-2682"
+PIPELINE_VERSION = "v3-multihorizon-spread-10728"
+
+
+def align_feature_frame(
+    df: pd.DataFrame,
+    feature_names: List[str] = OPERATIONAL_FEATURES,
+) -> pd.DataFrame:
+    """Return a clean float DataFrame aligned to feature_names, backfilling defaults for legacy inputs."""
+    aligned = df.copy()
+    for col in feature_names:
+        if col not in aligned.columns:
+            aligned[col] = DEFAULT_FEATURE_VALUES.get(col, 0.0)
+        else:
+            aligned[col] = pd.to_numeric(aligned[col], errors="coerce").fillna(DEFAULT_FEATURE_VALUES.get(col, 0.0))
+    return aligned[feature_names].astype(float)
+
+
+def _load_and_split_chronologically(
+    csv_path: Union[str, Path] = DATA_PATH,
+    test_size: float = 0.2,
+    random_state: int = 42,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
+    """
+    Load processed dataset and apply a strict chronological train/test split when
+    `valid_date` is present (out-of-time evaluation), else stratified random split.
+    """
+    file_path = Path(csv_path)
+    if not file_path.is_file():
+        raise FileNotFoundError(f"Input dataset not found at: {file_path.resolve()}")
+
+    df = pd.read_csv(file_path)
+    core_required = ["predicted_temp", "predicted_rainfall", "wind_shear", "pressure_drop", TARGET_COL]
+    missing = [c for c in core_required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Dataset missing required columns: {missing}")
+
+    if "valid_date" in df.columns and df["valid_date"].notna().sum() > 0:
+        sort_cols = [c for c in ["valid_date", "station_name", "lead_day"] if c in df.columns]
+        df = df.sort_values(sort_cols).reset_index(drop=True)
+        unique_dates = sorted(df["valid_date"].astype(str).unique())
+        if len(unique_dates) >= 5:
+            split_idx = max(1, min(len(unique_dates) - 1, int(len(unique_dates) * (1.0 - test_size))))
+            train_dates = set(unique_dates[:split_idx])
+            train_mask = df["valid_date"].astype(str).isin(train_dates)
+            df_train = df.loc[train_mask].copy()
+            df_test = df.loc[~train_mask].copy()
+            split_meta = {
+                "validation_scheme": "chronological_holdout",
+                "train_range": f"{unique_dates[0]} .. {unique_dates[split_idx - 1]}",
+                "test_range": f"{unique_dates[split_idx]} .. {unique_dates[-1]}",
+            }
+        else:
+            df_train, df_test = train_test_split(df, test_size=test_size, random_state=random_state, stratify=df[TARGET_COL])
+            split_meta = {"validation_scheme": "stratified_random", "train_range": "n/a", "test_range": "n/a"}
+    else:
+        df_train, df_test = train_test_split(df, test_size=test_size, random_state=random_state, stratify=df[TARGET_COL])
+        split_meta = {"validation_scheme": "stratified_random", "train_range": "n/a", "test_range": "n/a"}
+
+    X_train = align_feature_frame(df_train, OPERATIONAL_FEATURES)
+    X_test = align_feature_frame(df_test, OPERATIONAL_FEATURES)
+    y_train = df_train[TARGET_COL].astype(int).copy()
+    y_test = df_test[TARGET_COL].astype(int).copy()
+    return X_train, X_test, y_train, y_test, df_train, df_test, split_meta
 
 
 def load_and_split_data(
@@ -54,31 +135,51 @@ def load_and_split_data(
     random_state: int = 42
 ) -> TupleData:
     """
-    Load processed dataset and split into train and test partitions.
+    Load processed dataset and split into train and test partitions (chronologically when dates exist).
     Excludes ground-truth observations and error columns to avoid data leakage.
     """
-    file_path = Path(csv_path)
-    if not file_path.is_file():
-        raise FileNotFoundError(f"Input dataset not found at: {file_path.resolve()}")
-
-    df = pd.read_csv(file_path)
-
-    missing = [c for c in OPERATIONAL_FEATURES + [TARGET_COL] if c not in df.columns]
-    if missing:
-        raise ValueError(f"Dataset missing required columns: {missing}")
-
-    X = df[OPERATIONAL_FEATURES].copy()
-    y = df[TARGET_COL].copy()
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X,
-        y,
+    X_train, X_test, y_train, y_test, _df_tr, _df_te, _meta = _load_and_split_chronologically(
+        csv_path=csv_path,
         test_size=test_size,
         random_state=random_state,
-        stratify=y
     )
-
     return X_train, X_test, y_train, y_test
+
+
+def _calibrate_classifier(
+    base_estimator: Any,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_test: pd.DataFrame,
+    y_test: pd.Series,
+) -> Tuple[Any, str, np.ndarray, np.ndarray]:
+    """
+    Apply isotonic probability calibration via internal out-of-fold CV on X_train only.
+    Returns (model_for_inference, calibration_method, y_pred_test, y_prob_test).
+    """
+    raw_pred = base_estimator.predict(X_test)
+    raw_prob = base_estimator.predict_proba(X_test)[:, 1]
+    try:
+        pos_count = int((y_train == 1).sum())
+        cv_folds = 3 if pos_count >= 15 else 2
+        if pos_count < 6:
+            return base_estimator, "none", raw_pred, raw_prob
+
+        calibrated = CalibratedClassifierCV(estimator=clone(base_estimator), method="isotonic", cv=cv_folds)
+        calibrated.fit(X_train, y_train)
+        cal_prob = calibrated.predict_proba(X_test)[:, 1]
+        cal_pred = (cal_prob >= 0.5).astype(int)
+        cal_auc = roc_auc_score(y_test, cal_prob)
+        raw_auc = roc_auc_score(y_test, raw_prob)
+        cal_brier = brier_score_loss(y_test, cal_prob)
+        raw_brier = brier_score_loss(y_test, raw_prob)
+
+        if cal_auc >= raw_auc - 0.015 and cal_brier <= raw_brier + 0.01:
+            return calibrated, "isotonic", cal_pred, cal_prob
+    except Exception as exc:
+        print(f"[!] Calibration fallback to uncalibrated champion ({exc})")
+
+    return base_estimator, "none", raw_pred, raw_prob
 
 
 def train_and_evaluate_models(
@@ -89,19 +190,17 @@ def train_and_evaluate_models(
     random_state: int = 42
 ) -> Dict[str, Any]:
     """
-    Train XGBoost, Random Forest, and a Soft-Voting Ensemble.
-    Compares metrics (ROC-AUC, F1, Precision, Recall) and returns the best model.
+    Train XGBoost, Random Forest, and a Soft-Voting Ensemble, evaluate chronological
+    discrimination & Brier calibration, and calibrate the champion probabilities.
     """
-    # Calculate scale_pos_weight to compensate for ~15% bust prevalence
     neg_count = (y_train == 0).sum()
     pos_count = (y_train == 1).sum()
     scale_pos_weight = float(neg_count / max(pos_count, 1))
 
-    # 1. XGBoost Classifier
     xgb_clf = xgb.XGBClassifier(
-        n_estimators=160,
+        n_estimators=180,
         max_depth=4,
-        learning_rate=0.06,
+        learning_rate=0.05,
         subsample=0.85,
         colsample_bytree=0.85,
         scale_pos_weight=scale_pos_weight,
@@ -110,17 +209,15 @@ def train_and_evaluate_models(
         random_state=random_state,
     )
 
-    # 2. Random Forest Classifier
     rf_clf = RandomForestClassifier(
-        n_estimators=160,
-        max_depth=6,
+        n_estimators=180,
+        max_depth=7,
         class_weight="balanced",
         min_samples_split=6,
         random_state=random_state,
         n_jobs=-1
     )
 
-    # 3. Soft Voting Ensemble
     ensemble_clf = VotingClassifier(
         estimators=[
             ("xgb", xgb_clf),
@@ -138,44 +235,63 @@ def train_and_evaluate_models(
     eval_results = {}
     best_name = None
     best_auc = -1.0
-    best_model = None
+    best_raw_model = None
 
-    print("\n--- MODEL BENCHMARKING ON HOLD-OUT TEST SET ---")
+    print("\n--- MODEL BENCHMARKING ON CHRONOLOGICAL HOLD-OUT TEST SET ---")
     for name, model in candidates.items():
         model.fit(X_train, y_train)
         y_pred = model.predict(X_test)
         y_prob = model.predict_proba(X_test)[:, 1]
 
         auc = roc_auc_score(y_test, y_prob)
-        f1 = f1_score(y_test, y_pred)
-        precision = precision_score(y_test, y_pred)
-        recall = recall_score(y_test, y_pred)
+        brier = brier_score_loss(y_test, y_prob)
+        f1 = f1_score(y_test, y_pred, zero_division=0)
+        precision = precision_score(y_test, y_pred, zero_division=0)
+        recall = recall_score(y_test, y_pred, zero_division=0)
         acc = accuracy_score(y_test, y_pred)
 
         eval_results[name] = {
             "model": model,
             "roc_auc": round(float(auc), 4),
+            "brier_score": round(float(brier), 4),
             "f1": round(float(f1), 4),
             "precision": round(float(precision), 4),
             "recall": round(float(recall), 4),
             "accuracy": round(float(acc), 4),
         }
 
-        print(f"[{name}] AUC: {auc:.4f} | F1: {f1:.4f} | Precision: {precision:.4f} | Recall: {recall:.4f}")
+        print(f"[{name}] AUC: {auc:.4f} | Brier: {brier:.4f} | F1: {f1:.4f} | Precision: {precision:.4f} | Recall: {recall:.4f}")
 
-        # Selection criteria: prioritizing ROC-AUC & F1 balance
         if auc > best_auc:
             best_auc = auc
             best_name = name
-            best_model = model
+            best_raw_model = model
 
-    print(f"\n[*] Selected Champion Architecture: {best_name} (ROC-AUC: {best_auc:.4f})")
+    cal_model, calibration_method, cal_pred, cal_prob = _calibrate_classifier(
+        best_raw_model, X_train, y_train, X_test, y_test
+    )
+    if calibration_method != "none":
+        eval_results[best_name]["roc_auc"] = round(float(roc_auc_score(y_test, cal_prob)), 4)
+        eval_results[best_name]["brier_score"] = round(float(brier_score_loss(y_test, cal_prob)), 4)
+        eval_results[best_name]["f1"] = round(float(f1_score(y_test, cal_pred, zero_division=0)), 4)
+        eval_results[best_name]["precision"] = round(float(precision_score(y_test, cal_pred, zero_division=0)), 4)
+        eval_results[best_name]["recall"] = round(float(recall_score(y_test, cal_pred, zero_division=0)), 4)
+        eval_results[best_name]["accuracy"] = round(float(accuracy_score(y_test, cal_pred)), 4)
+        eval_results[best_name]["model"] = cal_model
 
-    # If ensemble was chosen, we also keep the trained XGBoost for native TreeExplainer
+    print(
+        f"\n[*] Selected Champion Architecture: {best_name} "
+        f"(Calibration: {calibration_method} | ROC-AUC: {eval_results[best_name]['roc_auc']:.4f} | "
+        f"Brier: {eval_results[best_name]['brier_score']:.4f})"
+    )
+
     return {
         "champion_name": best_name,
-        "champion_model": best_model,
+        "champion_model": cal_model,
+        "raw_champion_model": best_raw_model,
         "xgb_model": xgb_clf,
+        "raw_rf_model": rf_clf,
+        "calibration_method": calibration_method,
         "eval_results": eval_results,
     }
 
@@ -219,10 +335,11 @@ def save_model_artifact(
     explainer: Any,
     feature_names: List[str],
     metadata: Dict[str, Any],
-    destination: Path = MODEL_PATH
+    destination: Path = MODEL_PATH,
+    extra_fields: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
-    Serialize the complete model artifact bundle with metadata and explainer.
+    Serialize the complete model artifact bundle with metadata, explainer, and optional aux heads.
     """
     bundle = {
         "model": model,
@@ -230,8 +347,47 @@ def save_model_artifact(
         "feature_names": feature_names,
         "metadata": metadata,
     }
+    if extra_fields:
+        bundle.update(extra_fields)
     joblib.dump(bundle, destination)
     print(f"\n[+] Trained model bundle successfully saved to: {destination.resolve()}")
+
+
+def _fit_auxiliary_head(
+    X_train: pd.DataFrame,
+    y_train_sub: pd.Series,
+    X_test: pd.DataFrame,
+    y_test_sub: pd.Series,
+    label: str,
+    random_state: int = 42,
+) -> Tuple[Optional[Any], Optional[float], Optional[float]]:
+    """Train a calibrated XGBoost sub-head for temperature or rainfall bust decomposition."""
+    pos_train = int((y_train_sub == 1).sum())
+    pos_test = int((y_test_sub == 1).sum())
+    if pos_train < 10 or pos_test < 3:
+        return None, None, None
+
+    neg_train = int((y_train_sub == 0).sum())
+    spw = float(neg_train / max(pos_train, 1))
+    clf = xgb.XGBClassifier(
+        n_estimators=120,
+        max_depth=4,
+        learning_rate=0.05,
+        subsample=0.85,
+        colsample_bytree=0.85,
+        scale_pos_weight=spw,
+        base_score=0.5,
+        eval_metric="logloss",
+        random_state=random_state,
+    )
+    clf.fit(X_train, y_train_sub)
+    cal_head, _cal_method, _pred, cal_prob = _calibrate_classifier(
+        clf, X_train, y_train_sub, X_test, y_test_sub
+    )
+    auc = round(float(roc_auc_score(y_test_sub, cal_prob)), 4)
+    brier = round(float(brier_score_loss(y_test_sub, cal_prob)), 4)
+    print(f"[+] Auxiliary {label} head trained: ROC-AUC={auc:.4f} | Brier={brier:.4f}")
+    return cal_head, auc, brier
 
 
 def get_shap_explanation(
@@ -241,14 +397,6 @@ def get_shap_explanation(
 ) -> Dict[str, Any]:
     """
     Real-time inference & Explainable AI helper function.
-    
-    Accepts:
-        input_data: dictionary of feature names/values, a DataFrame row, or list in standard order.
-    Returns:
-        JSON-serializable dictionary with:
-        - predicted_bust: 0 or 1
-        - bust_probability: probability between 0.0 and 1.0
-        - top_contributing_features: top K features driving the prediction, with direction of impact.
     """
     bundle_file = Path(model_bundle_path)
     if not bundle_file.is_file():
@@ -261,22 +409,28 @@ def get_shap_explanation(
 
     # Normalize input into a 1-row DataFrame
     if isinstance(input_data, dict):
-        df_input = pd.DataFrame([input_data])
+        df_raw = pd.DataFrame([input_data])
     elif isinstance(input_data, list):
-        df_input = pd.DataFrame([input_data], columns=feature_names)
+        cols = feature_names[: len(input_data)]
+        df_raw = pd.DataFrame([input_data], columns=cols)
     elif isinstance(input_data, pd.DataFrame):
-        df_input = input_data[feature_names].head(1).copy()
+        df_raw = input_data.head(1).copy()
     else:
         raise TypeError("input_data must be a dict, pandas DataFrame, or list of feature values")
 
-    # Ensure all required features are present in correct column order
-    df_input = df_input[feature_names].astype(float)
+    # Align and backfill optional multi-horizon defaults cleanly
+    df_input = align_feature_frame(df_raw, feature_names)
 
     # Model inference
     pred_class = int(model.predict(df_input)[0])
     prob = float(model.predict_proba(df_input)[0, 1])
 
-    # Compute instance SHAP values
+    temp_model = bundle.get("temp_model")
+    rain_model = bundle.get("rain_model")
+    temp_prob = round(float(temp_model.predict_proba(df_input)[0, 1]), 4) if temp_model is not None else None
+    rain_prob = round(float(rain_model.predict_proba(df_input)[0, 1]), 4) if rain_model is not None else None
+
+    # Compute instance SHAP values using native TreeExplainer
     raw_shap = explainer.shap_values(df_input)
     if isinstance(raw_shap, list):
         shap_vec = raw_shap[1][0]
@@ -305,12 +459,17 @@ def get_shap_explanation(
         for item in feature_impacts[:top_k]
     ]
 
-    return {
+    result: Dict[str, Any] = {
         "predicted_bust": pred_class,
         "bust_probability": round(prob, 4),
         "status": "BUST ALERT: High Probability of Forecast Failure" if pred_class == 1 else "NOMINAL: Forecast Reliable",
-        "top_contributing_features": top_drivers
+        "top_contributing_features": top_drivers,
     }
+    if temp_prob is not None:
+        result["temp_bust_probability"] = temp_prob
+    if rain_prob is not None:
+        result["rain_bust_probability"] = rain_prob
+    return result
 
 
 def train_and_build_bundle(
@@ -319,49 +478,78 @@ def train_and_build_bundle(
     model_destination: Path = MODEL_PATH,
 ) -> Dict[str, Any]:
     """
-    Train benchmark classifiers on the processed weather dataset, build the
-    SHAP TreeExplainer bundle, and optionally persist to disk.
+    Train benchmark classifiers on the processed weather dataset using a strict
+    chronological hold-out split, calibrate probabilities, fit auxiliary temp/rain
+    sub-heads, build the SHAP TreeExplainer bundle, and optionally persist to disk.
     """
-    X_train, X_test, y_train, y_test = load_and_split_data(csv_path)
+    X_train, X_test, y_train, y_test, df_train, df_test, split_meta = _load_and_split_chronologically(csv_path)
     sample_count = int(len(y_train) + len(y_test))
     bust_rate = round(float((y_train.sum() + y_test.sum()) / max(sample_count, 1)), 4)
 
-    print(f"[+] Training Set: {len(X_train)} samples | Test Set: {len(X_test)} samples")
-    print(f"[+] Operational Features: {OPERATIONAL_FEATURES}")
+    print(f"[+] Validation Scheme: {split_meta['validation_scheme']} | Train: {len(X_train)} | Test: {len(X_test)}")
+    print(f"[+] Operational Features ({len(OPERATIONAL_FEATURES)}): {OPERATIONAL_FEATURES}")
 
     train_output = train_and_evaluate_models(X_train, X_test, y_train, y_test)
     champion_name = train_output["champion_name"]
     champion_model = train_output["champion_model"]
 
-    explainer_model = train_output["xgb_model"] if "Ensemble" in champion_name else champion_model
+    # TreeExplainer requires an uncalibrated native tree estimator (never CalibratedClassifierCV or VotingClassifier)
+    explainer_model = (
+        train_output["xgb_model"]
+        if "Ensemble" in champion_name
+        else train_output["raw_champion_model"]
+    )
     try:
         explainer, _shap_vals, global_drivers = compute_shap_explainability(explainer_model, X_test)
     except Exception as exc:
-        rf_fallback = next(
-            (
-                entry["model"]
-                for name, entry in train_output["eval_results"].items()
-                if "Random" in name and isinstance(entry, dict) and "model" in entry
-            ),
-            None,
-        )
+        rf_fallback = train_output.get("raw_rf_model")
         if rf_fallback is None or rf_fallback is explainer_model:
             raise
-        print(f"[!] SHAP TreeExplainer fallback to RandomForest ({exc})")
+        print(f"[!] SHAP TreeExplainer fallback to raw RandomForest ({exc})")
+        explainer_model = rf_fallback
         explainer, _shap_vals, global_drivers = compute_shap_explainability(rf_fallback, X_test)
+
+    temp_model: Optional[Any] = None
+    rain_model: Optional[Any] = None
+    temp_auc: Optional[float] = None
+    rain_auc: Optional[float] = None
+    if "is_temp_bust" in df_train.columns and "is_temp_bust" in df_test.columns:
+        temp_model, temp_auc, _ = _fit_auxiliary_head(
+            X_train, df_train["is_temp_bust"].astype(int), X_test, df_test["is_temp_bust"].astype(int), "Temperature Bust"
+        )
+    if "is_rain_bust" in df_train.columns and "is_rain_bust" in df_test.columns:
+        rain_model, rain_auc, _ = _fit_auxiliary_head(
+            X_train, df_train["is_rain_bust"].astype(int), X_test, df_test["is_rain_bust"].astype(int), "Rainfall Bust"
+        )
 
     raw_metrics = train_output["eval_results"][champion_name]
     clean_metrics = {k: v for k, v in raw_metrics.items() if k != "model"}
+    clean_metrics["calibration"] = train_output["calibration_method"]
+    clean_metrics["validation_scheme"] = split_meta["validation_scheme"]
+    if temp_auc is not None:
+        clean_metrics["temp_head_auc"] = temp_auc
+    if rain_auc is not None:
+        clean_metrics["rain_head_auc"] = rain_auc
 
     global_drivers_list = global_drivers.to_dict(orient="records")
     metadata = {
         "pipeline_version": PIPELINE_VERSION,
-        "training_source": "Open-Meteo NWP Archive (18 Indian Stations, Day+3 vs Day-0)",
+        "training_source": "Open-Meteo Multi-Horizon Archive (18 Indian Stations, Day+1/3/5/7 ECMWF vs GFS)",
+        "validation_scheme": split_meta["validation_scheme"],
+        "train_date_range": split_meta["train_range"],
+        "test_date_range": split_meta["test_range"],
+        "calibration": train_output["calibration_method"],
+        "lead_days": [1, 3, 5, 7],
         "sample_count": sample_count,
         "bust_rate": bust_rate,
         "champion_name": champion_name,
         "metrics": clean_metrics,
         "global_drivers": global_drivers_list,
+    }
+    extra_fields = {
+        "explainer_model": explainer_model,
+        "temp_model": temp_model,
+        "rain_model": rain_model,
     }
 
     if save_to_disk:
@@ -372,6 +560,7 @@ def train_and_build_bundle(
                 feature_names=OPERATIONAL_FEATURES,
                 metadata=metadata,
                 destination=model_destination,
+                extra_fields=extra_fields,
             )
         except OSError as exc:
             print(f"[!] Could not write model artifact to {model_destination}: {exc}")
@@ -396,6 +585,9 @@ def train_and_build_bundle(
     return {
         "model": champion_model,
         "explainer": explainer,
+        "explainer_model": explainer_model,
+        "temp_model": temp_model,
+        "rain_model": rain_model,
         "feature_names": OPERATIONAL_FEATURES,
         "metadata": metadata,
     }
@@ -417,7 +609,12 @@ def main():
         "predicted_temp": 32.5,
         "predicted_rainfall": 24.0,
         "wind_shear": 38.5,
-        "pressure_drop": 18.2
+        "pressure_drop": 18.2,
+        "lead_day": 5,
+        "relative_humidity": 88.0,
+        "cape": 1450.0,
+        "model_temp_spread": 3.4,
+        "model_rain_spread": 18.5,
     }
     print("\n--- TEST RUN OF get_shap_explanation() ON SEVERE TEST CASE ---")
     print(f"Sample Input: {sample_severe_case}")

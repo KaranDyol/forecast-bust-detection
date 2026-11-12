@@ -74,7 +74,34 @@ def test_api():
         print(json.dumps(data_calm, indent=2))
         print(f"[+] Calm Case Risk: {data_calm['risk_probability_percentage']}% (Warning: {data_calm['is_high_risk_warning']})")
 
-        # 4. Input Validation Error Test (Latitude > 90)
+        # 4. Test Step 2 Multi-Horizon + ECMWF/GFS Ensemble Spread Batch Endpoint
+        batch_payload = {
+            "items": [
+                {
+                    "latitude": 19.0760,
+                    "longitude": 72.8777,
+                    "predicted_temp": 31.8,
+                    "predicted_rainfall": 45.0,
+                    "wind_shear": 28.0,
+                    "pressure_drop": 14.5,
+                    "lead_day": 5,
+                    "relative_humidity": 89.0,
+                    "cape": 1850.0,
+                    "model_temp_spread": 2.9,
+                    "model_rain_spread": 22.0,
+                },
+                calm_payload,
+            ]
+        }
+        res_batch = client.post("/predict_batch", json=batch_payload)
+        assert res_batch.status_code == 200, f"Batch prediction failed: {res_batch.text}"
+        data_batch = res_batch.json()
+        assert data_batch["count"] == 2
+        assert len(data_batch["results"]) == 2
+        assert "risk_probability_percentage" in data_batch["results"][0]
+        print(f"\n[+] POST /predict_batch -> Scored {data_batch['count']} multi-horizon items successfully.")
+
+        # 5. Input Validation Error Test (Latitude > 90)
         bad_payload = severe_payload.copy()
         bad_payload["latitude"] = 999.0
         res_bad = client.post("/predict_bust_risk", json=bad_payload)

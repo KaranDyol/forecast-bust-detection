@@ -247,12 +247,15 @@ def _dialect_upsert(
     if not rows:
         return 0
 
+    deduped_map = {tuple(row[col] for col in conflict_cols): row for row in rows}
+    deduped_rows = list(deduped_map.values())
+
     dialect = session.bind.dialect.name if session.bind is not None else "sqlite"
     insert_fn = pg_insert if dialect == "postgresql" else sqlite_insert
 
     total = 0
-    for idx in range(0, len(rows), chunk_size):
-        chunk = list(rows[idx : idx + chunk_size])
+    for idx in range(0, len(deduped_rows), chunk_size):
+        chunk = list(deduped_rows[idx : idx + chunk_size])
         stmt = insert_fn(model_cls).values(chunk)
         stmt = stmt.on_conflict_do_update(
             index_elements=list(conflict_cols),

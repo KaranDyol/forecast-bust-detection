@@ -30,12 +30,22 @@ INDIA_ARCHIVE_STATIONS: List[Tuple[str, float, float]] = [
 ]
 
 PREVIOUS_RUNS_URL = "https://previous-runs-api.open-meteo.com/v1/forecast"
+ARCHIVE_LEAD_DAYS: Tuple[int, ...] = (1, 3, 5, 7)
 ARCHIVE_HOURLY_VARS = (
-    "temperature_2m,temperature_2m_previous_day3,"
-    "precipitation,precipitation_previous_day3,"
-    "pressure_msl_previous_day3,"
-    "wind_speed_10m_previous_day3,wind_direction_10m_previous_day3,"
-    "wind_speed_500hPa,wind_direction_500hPa"
+    "temperature_2m,precipitation,wind_speed_500hPa,wind_direction_500hPa,"
+    + ",".join(
+        f"{base}_previous_day{d}"
+        for d in ARCHIVE_LEAD_DAYS
+        for base in (
+            "temperature_2m",
+            "precipitation",
+            "pressure_msl",
+            "wind_speed_10m",
+            "wind_direction_10m",
+            "relative_humidity_2m",
+            "cape",
+        )
+    )
 )
 
 
@@ -46,27 +56,55 @@ def _vector_wind_shear(w1: float, d1: float, w2: float, d2: float) -> float:
     return math.hypot(u2 - u1, v2 - v1)
 
 
+def _first_nonempty_series(hourly: Dict[str, object], *keys: str) -> List[object]:
+    """Return the first non-empty list found across candidate Open-Meteo series keys."""
+    for key in keys:
+        series = hourly.get(key)
+        if isinstance(series, list) and series:
+            return series
+    return []
+
+
 def fetch_open_meteo_archive_data(
     past_days: int = 150,
     include_metadata: bool = False,
+    leads: Tuple[int, ...] = ARCHIVE_LEAD_DAYS,
 ) -> pd.DataFrame:
     """
-    Fetch real paired historical NWP forecasts (Day+3 run vs Day-0 verification)
-    across 18 Indian synoptic stations via Open-Meteo's Previous Model Runs API.
+    Fetch real paired historical NWP forecasts (Day+1/3/5/7 runs vs Day-0 verification)
+    across 18 Indian synoptic stations via Open-Meteo's Previous Model Runs API,
+    including multi-model ECMWF-IFS025 vs GFS-Seamless ensemble spread.
     """
+    hourly_vars = (
+        "temperature_2m,precipitation,wind_speed_500hPa,wind_direction_500hPa,"
+        + ",".join(
+            f"{base}_previous_day{d}"
+            for d in leads
+            for base in (
+                "temperature_2m",
+                "precipitation",
+                "pressure_msl",
+                "wind_speed_10m",
+                "wind_direction_10m",
+                "relative_humidity_2m",
+                "cape",
+            )
+        )
+    )
     records: List[Dict[str, object]] = []
-    for chunk_start in range(0, len(INDIA_ARCHIVE_STATIONS), 6):
-        batch = INDIA_ARCHIVE_STATIONS[chunk_start : chunk_start + 6]
+    for chunk_start in range(0, len(INDIA_ARCHIVE_STATIONS), 3):
+        batch = INDIA_ARCHIVE_STATIONS[chunk_start : chunk_start + 3]
         params = {
             "latitude": ",".join(f"{s[1]:.4f}" for s in batch),
             "longitude": ",".join(f"{s[2]:.4f}" for s in batch),
-            "hourly": ARCHIVE_HOURLY_VARS,
+            "hourly": hourly_vars,
+            "models": "ecmwf_ifs025,gfs_seamless",
             "past_days": past_days,
             "forecast_days": 0,
             "wind_speed_unit": "ms",
             "timezone": "Asia/Kolkata",
         }
-        resp = requests.get(PREVIOUS_RUNS_URL, params=params, timeout=45)
+        resp = requests.get(PREVIOUS_RUNS_URL, params=params, timeout=60)
         resp.raise_for_status()
         payload = resp.json()
         if isinstance(payload, dict):
@@ -78,59 +116,85 @@ def fetch_open_meteo_archive_data(
             n_hours = len(times)
             n_days = n_hours // 24
             elevation_val = loc.get("elevation")
+
+            t_obs_arr = _first_nonempty_series(hourly, "temperature_2m_ecmwf_ifs025", "temperature_2m_gfs_seamless", "temperature_2m")
+            r_obs_arr = _first_nonempty_series(hourly, "precipitation_ecmwf_ifs025", "precipitation_gfs_seamless", "precipitation")
+            w5_arr = _first_nonempty_series(hourly, "wind_speed_500hPa_ecmwf_ifs025", "wind_speed_500hPa_gfs_seamless", "wind_speed_500hPa")
+            d5_arr = _first_nonempty_series(hourly, "wind_direction_500hPa_ecmwf_ifs025", "wind_direction_500hPa_gfs_seamless", "wind_direction_500hPa")
+            if not (t_obs_arr and r_obs_arr and w5_arr and d5_arr):
+                continue
+
             for day_idx in range(1, n_days):
                 s = day_idx * 24
                 e = (day_idx + 1) * 24
-                t_obs = [float(x) for x in hourly["temperature_2m"][s:e] if x is not None]
-                t_pre = [float(x) for x in hourly["temperature_2m_previous_day3"][s:e] if x is not None]
-                r_obs = [float(x) for x in hourly["precipitation"][s:e] if x is not None]
-                r_pre = [float(x) for x in hourly["precipitation_previous_day3"][s:e] if x is not None]
-                p_arr = hourly["pressure_msl_previous_day3"]
-                pdrops = [
-                    float(p_arr[idx - 24]) - float(p_arr[idx])
-                    for idx in range(s, e)
-                    if p_arr[idx - 24] is not None and p_arr[idx] is not None
-                ]
-                sh_list = [
-                    _vector_wind_shear(
-                        float(hourly["wind_speed_10m_previous_day3"][idx]),
-                        float(hourly["wind_direction_10m_previous_day3"][idx]),
-                        float(hourly["wind_speed_500hPa"][idx]),
-                        float(hourly["wind_direction_500hPa"][idx]),
-                    )
-                    for idx in range(s, e)
-                    if None not in (
-                        hourly["wind_speed_10m_previous_day3"][idx],
-                        hourly["wind_direction_10m_previous_day3"][idx],
-                        hourly["wind_speed_500hPa"][idx],
-                        hourly["wind_direction_500hPa"][idx],
-                    )
-                ]
-                if not (t_obs and t_pre and r_obs and r_pre):
+                t_obs = [float(x) for x in t_obs_arr[s:e] if x is not None]
+                r_obs = [float(x) for x in r_obs_arr[s:e] if x is not None]
+                if not (t_obs and r_obs):
                     continue
+                act_t = round(max(t_obs), 2)
+                act_r = round(sum(r_obs), 2)
                 valid_date_str = str(times[s])[:10]
-                issued_date_str = (date.fromisoformat(valid_date_str) - timedelta(days=3)).isoformat()
-                row: Dict[str, object] = {
-                    "predicted_temp": round(max(t_pre), 2),
-                    "actual_temp": round(max(t_obs), 2),
-                    "predicted_rainfall": round(sum(r_pre), 2),
-                    "actual_rainfall": round(sum(r_obs), 2),
-                    "wind_shear": round(float(np.percentile(sh_list, 85)) if sh_list else 12.0, 2),
-                    "pressure_drop": round(max([0.5] + pdrops), 2),
-                }
-                if include_metadata:
-                    row.update({
-                        "station_name": station_name,
-                        "valid_date": valid_date_str,
-                        "issued_date": issued_date_str,
-                        "lead_day": 3,
-                        "nwp_model": "open_meteo_day3",
-                        "elevation_m": float(elevation_val) if elevation_val is not None else None,
-                    })
-                records.append(row)
-        time.sleep(0.5)
 
-    return pd.DataFrame(records)
+                for lead_d in leads:
+                    ec_t = [float(x) for x in _first_nonempty_series(hourly, f"temperature_2m_previous_day{lead_d}_ecmwf_ifs025", f"temperature_2m_previous_day{lead_d}")[s:e] if x is not None]
+                    gf_t = [float(x) for x in _first_nonempty_series(hourly, f"temperature_2m_previous_day{lead_d}_gfs_seamless", f"temperature_2m_previous_day{lead_d}")[s:e] if x is not None]
+                    ec_r = [float(x) for x in _first_nonempty_series(hourly, f"precipitation_previous_day{lead_d}_ecmwf_ifs025", f"precipitation_previous_day{lead_d}")[s:e] if x is not None]
+                    gf_r = [float(x) for x in _first_nonempty_series(hourly, f"precipitation_previous_day{lead_d}_gfs_seamless", f"precipitation_previous_day{lead_d}")[s:e] if x is not None]
+                    if not (ec_t and gf_t and ec_r and gf_r):
+                        continue
+
+                    ec_t_max, gf_t_max = max(ec_t), max(gf_t)
+                    ec_r_sum, gf_r_sum = sum(ec_r), sum(gf_r)
+
+                    p_arr = _first_nonempty_series(hourly, f"pressure_msl_previous_day{lead_d}_ecmwf_ifs025", f"pressure_msl_previous_day{lead_d}")
+                    pdrops = [
+                        float(p_arr[idx - 24]) - float(p_arr[idx])
+                        for idx in range(s, e)
+                        if idx < len(p_arr) and p_arr[idx - 24] is not None and p_arr[idx] is not None
+                    ]
+                    w10_arr = _first_nonempty_series(hourly, f"wind_speed_10m_previous_day{lead_d}_ecmwf_ifs025", f"wind_speed_10m_previous_day{lead_d}")
+                    d10_arr = _first_nonempty_series(hourly, f"wind_direction_10m_previous_day{lead_d}_ecmwf_ifs025", f"wind_direction_10m_previous_day{lead_d}")
+                    sh_list = [
+                        _vector_wind_shear(float(w10_arr[idx]), float(d10_arr[idx]), float(w5_arr[idx]), float(d5_arr[idx]))
+                        for idx in range(s, e)
+                        if idx < len(w10_arr) and idx < len(d10_arr) and idx < len(w5_arr) and idx < len(d5_arr)
+                        and None not in (w10_arr[idx], d10_arr[idx], w5_arr[idx], d5_arr[idx])
+                    ]
+                    rh_arr = _first_nonempty_series(hourly, f"relative_humidity_2m_previous_day{lead_d}_ecmwf_ifs025", f"relative_humidity_2m_previous_day{lead_d}_gfs_seamless", f"relative_humidity_2m_previous_day{lead_d}")
+                    rh_list = [float(x) for x in rh_arr[s:e] if x is not None]
+                    # Open-Meteo historical archive populates CAPE on gfs_seamless (ecmwf archive CAPE is null)
+                    cape_arr = _first_nonempty_series(hourly, f"cape_previous_day{lead_d}_gfs_seamless", f"cape_previous_day{lead_d}")
+                    cape_list = [float(x) for x in cape_arr[s:e] if x is not None]
+
+                    issued_date_str = (date.fromisoformat(valid_date_str) - timedelta(days=lead_d)).isoformat()
+                    row: Dict[str, object] = {
+                        "predicted_temp": round(ec_t_max, 2),
+                        "actual_temp": act_t,
+                        "predicted_rainfall": round(ec_r_sum, 2),
+                        "actual_rainfall": act_r,
+                        "wind_shear": round(float(np.percentile(sh_list, 85)) if sh_list else 12.0, 2),
+                        "pressure_drop": round(max([0.5] + pdrops), 2),
+                        "lead_day": int(lead_d),
+                        "relative_humidity": round(float(np.mean(rh_list)) if rh_list else 65.0, 2),
+                        "cape": round(max(cape_list) if cape_list else 0.0, 1),
+                        "model_temp_spread": round(abs(ec_t_max - gf_t_max), 2),
+                        "model_rain_spread": round(abs(ec_r_sum - gf_r_sum), 2),
+                    }
+                    if include_metadata:
+                        row.update({
+                            "station_name": station_name,
+                            "valid_date": valid_date_str,
+                            "issued_date": issued_date_str,
+                            "nwp_model": "open_meteo_multihorizon",
+                            "elevation_m": float(elevation_val) if elevation_val is not None else None,
+                        })
+                    records.append(row)
+        time.sleep(0.4)
+
+    df_out = pd.DataFrame(records)
+    if include_metadata and not df_out.empty:
+        df_out = df_out.sort_values(["valid_date", "station_name", "lead_day"]).reset_index(drop=True)
+    return df_out
 
 
 def persist_archive_df_to_db(df_meta: pd.DataFrame) -> Dict[str, int]:
@@ -148,13 +212,13 @@ def persist_archive_df_to_db(df_meta: pd.DataFrame) -> Dict[str, int]:
     seed_stations(elevations=elevations)
 
     records = df_meta.to_dict(orient="records")
-    n_forecasts = upsert_forecast_snapshots(records, nwp_model="open_meteo_day3")
+    n_forecasts = upsert_forecast_snapshots(records, nwp_model="open_meteo_multihorizon")
     n_verifs = upsert_verification_outcomes(records, source="open_meteo_day0")
     return {"forecast_runs": n_forecasts, "verification_outcomes": n_verifs}
 
 
 def sync_archive_to_database(past_days: int = 150) -> Dict[str, int]:
-    """Fetch paired historical Day+3 forecasts vs Day-0 actuals and persist to DB."""
+    """Fetch paired historical multi-horizon (Day+1/3/5/7) forecasts vs Day-0 actuals and persist to DB."""
     df_meta = fetch_open_meteo_archive_data(past_days=past_days, include_metadata=True)
     return persist_archive_df_to_db(df_meta)
 
@@ -311,11 +375,16 @@ def label_forecast_busts(
 ) -> pd.DataFrame:
     """
     Define and label a Forecast Bust:
-    is_bust = 1 if (temp_error > temp_threshold OR rainfall_error > rainfall_threshold) else 0.
+    is_temp_bust = 1 if temp_error > temp_threshold else 0.
+    is_rain_bust = 1 if rainfall_error > rainfall_threshold else 0.
+    is_bust = 1 if (is_temp_bust OR is_rain_bust) else 0.
     """
     df = df.copy()
-    is_bust_condition = (df["temp_error"] > temp_threshold) | (df["rainfall_error"] > rainfall_threshold)
-    df["is_bust"] = is_bust_condition.astype(int)
+    is_temp = df["temp_error"] > temp_threshold
+    is_rain = df["rainfall_error"] > rainfall_threshold
+    df["is_temp_bust"] = is_temp.astype(int)
+    df["is_rain_bust"] = is_rain.astype(int)
+    df["is_bust"] = (is_temp | is_rain).astype(int)
     return df
 
 
@@ -330,15 +399,32 @@ def run_pipeline(
 ) -> pd.DataFrame:
     """
     End-to-end execution of Phase 1 Data Pipeline:
-    1. Loads Rattle dataset if supplied, otherwise generates synthetic meteorological dataset.
+    1. Fetches paired multi-horizon NWP archive (Day+1/3/5/7 ECMWF-IFS025 vs GFS-Seamless),
+       OR loads the Kaggle Rattle dataset if supplied, OR generates synthetic weather data.
     2. Validates schema and cleans records (removes nulls/infinities).
-    3. Calculates forecast error metrics.
-    4. Labels forecast busts.
-    5. Saves output to CSV and prints summary metrics.
+    3. Calculates forecast error metrics & dual temp/rainfall bust labels.
+    4. Saves output to CSV, syncs paired snapshots/outcomes to SQL, and prints summary metrics.
     """
     print("=" * 70)
     print("AI-BASED FORECAST BUST DETECTION: PHASE 1 DATA PIPELINE")
     print("=" * 70)
+
+    archive_feature_cols = [
+        "valid_date",
+        "issued_date",
+        "station_name",
+        "predicted_temp",
+        "actual_temp",
+        "predicted_rainfall",
+        "actual_rainfall",
+        "wind_shear",
+        "pressure_drop",
+        "lead_day",
+        "relative_humidity",
+        "cape",
+        "model_temp_spread",
+        "model_rain_spread",
+    ]
 
     # 1. Ingestion / Generation
     df_archive_meta: Optional[pd.DataFrame] = None
@@ -347,13 +433,11 @@ def run_pipeline(
         df_raw = load_rattle_weather_dataset(dataset_path)
     elif use_open_meteo_archive:
         try:
-            print("[+] Fetching real paired NWP archive (Day+3 vs Day-0) from Open-Meteo...")
+            print("[+] Fetching real multi-horizon NWP archive (Day+1/3/5/7 ECMWF vs GFS) from Open-Meteo...")
             df_archive_meta = fetch_open_meteo_archive_data(past_days=150, include_metadata=True)
             if df_archive_meta.empty:
                 raise ValueError("Open-Meteo archive returned 0 rows.")
-            df_raw = df_archive_meta[
-                ["predicted_temp", "actual_temp", "predicted_rainfall", "actual_rainfall", "wind_shear", "pressure_drop"]
-            ].copy()
+            df_raw = df_archive_meta[archive_feature_cols].copy()
         except Exception as exc:
             print(f"[!] Open-Meteo archive fetch failed ({exc}); falling back to synthetic generation.")
             df_archive_meta = None
@@ -363,6 +447,18 @@ def run_pipeline(
             print(f"[!] Warning: Specified path '{dataset_path}' not found. Falling back to synthetic generation.")
         print(f"[+] Generating {n_synthetic_samples} synthetic meteorological records...")
         df_raw = generate_synthetic_weather_data(n_samples=n_synthetic_samples, random_state=random_state)
+
+    # Ensure Step 2 operational columns always exist (for synthetic/Rattle fallbacks)
+    fallback_defaults = {
+        "lead_day": 3,
+        "relative_humidity": 65.0,
+        "cape": 250.0,
+        "model_temp_spread": 1.0,
+        "model_rain_spread": 2.0,
+    }
+    for col, default_val in fallback_defaults.items():
+        if col not in df_raw.columns:
+            df_raw[col] = default_val
 
     # 2. Schema check & Cleaning
     expected_cols = ["predicted_temp", "actual_temp", "predicted_rainfall", "actual_rainfall", "wind_shear", "pressure_drop"]
@@ -380,6 +476,19 @@ def run_pipeline(
         temp_threshold=temp_threshold,
         rainfall_threshold=rainfall_threshold
     )
+
+    ordered_cols = [
+        c for c in [
+            "valid_date", "issued_date", "station_name",
+            "predicted_temp", "actual_temp", "predicted_rainfall", "actual_rainfall",
+            "wind_shear", "pressure_drop", "lead_day", "relative_humidity", "cape",
+            "model_temp_spread", "model_rain_spread",
+            "temp_error", "rainfall_error", "is_temp_bust", "is_rain_bust", "is_bust",
+        ]
+        if c in df_final.columns
+    ]
+    remaining_cols = [c for c in df_final.columns if c not in ordered_cols]
+    df_final = df_final[ordered_cols + remaining_cols]
 
     # 5. Persist CSV & Database Storage
     out_file = Path(output_path)
