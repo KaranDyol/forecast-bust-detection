@@ -16,6 +16,8 @@ import folium
 from streamlit_folium import st_folium
 import plotly.graph_objects as go
 
+from stations_catalog import INDIAN_MET_STATIONS
+
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_PATH = BASE_DIR / "bust_model.pkl"
 
@@ -620,26 +622,41 @@ def is_api_reachable() -> bool:
         return False
 
 
-INDIAN_MET_STATIONS = [
-    {"name": "New Delhi (Safdarjung)", "state": "Delhi", "lat": 28.5847, "lon": 77.2066, "base_temp": 31.0, "zone": "North Plains"},
-    {"name": "Mumbai (Santacruz)", "state": "Maharashtra", "lat": 19.0760, "lon": 72.8777, "base_temp": 32.5, "zone": "West Coast"},
-    {"name": "Kolkata (Alipore)", "state": "West Bengal", "lat": 22.5726, "lon": 88.3639, "base_temp": 33.0, "zone": "East Coast / BoB"},
-    {"name": "Chennai (Meenambakkam)", "state": "Tamil Nadu", "lat": 13.0827, "lon": 80.2707, "base_temp": 34.0, "zone": "South Coast"},
-    {"name": "Bengaluru (HAL)", "state": "Karnataka", "lat": 12.9716, "lon": 77.5946, "base_temp": 27.5, "zone": "Deccan Plateau"},
-    {"name": "Hyderabad (Begumpet)", "state": "Telangana", "lat": 17.3850, "lon": 78.4867, "base_temp": 32.0, "zone": "Central Peninsula"},
-    {"name": "Bhubaneswar (Airport)", "state": "Odisha", "lat": 20.2961, "lon": 85.8245, "base_temp": 33.5, "zone": "East Coast / BoB"},
-    {"name": "Srinagar (Rambagh)", "state": "J&K", "lat": 34.0837, "lon": 74.7973, "base_temp": 18.0, "zone": "Western Himalaya"},
-    {"name": "Guwahati (Borjhar)", "state": "Assam", "lat": 26.1445, "lon": 91.7362, "base_temp": 29.5, "zone": "Northeast Basin"},
-    {"name": "Ahmedabad (Airport)", "state": "Gujarat", "lat": 23.0225, "lon": 72.5714, "base_temp": 35.0, "zone": "West Arid"},
-    {"name": "Jaipur (Sanganer)", "state": "Rajasthan", "lat": 26.9124, "lon": 75.7873, "base_temp": 34.5, "zone": "Northwest Semi-Arid"},
-    {"name": "Nagpur (Sonegaon)", "state": "Maharashtra", "lat": 21.1458, "lon": 79.0882, "base_temp": 33.0, "zone": "Central India"},
-    {"name": "Visakhapatnam (CWC)", "state": "Andhra Pradesh", "lat": 17.6868, "lon": 83.2185, "base_temp": 32.8, "zone": "East Coast / BoB"},
-    {"name": "Kochi (CIAL)", "state": "Kerala", "lat": 9.9312, "lon": 76.2673, "base_temp": 30.5, "zone": "Southwest Coast"},
-    {"name": "Patna (Aerodrome)", "state": "Bihar", "lat": 25.5941, "lon": 85.1376, "base_temp": 32.0, "zone": "Gangetic Plain"},
-    {"name": "Bhopal (Bairagarh)", "state": "Madhya Pradesh", "lat": 23.2599, "lon": 77.4126, "base_temp": 31.5, "zone": "Central India"},
-    {"name": "Pune (Shivajinagar)", "state": "Maharashtra", "lat": 18.5204, "lon": 73.8567, "base_temp": 30.0, "zone": "Western Ghats"},
-    {"name": "Dehradun (FRI)", "state": "Uttarakhand", "lat": 30.3165, "lon": 78.0322, "base_temp": 24.5, "zone": "Sub-Himalayan"},
-]
+@st.cache_resource(show_spinner=False)
+def ensure_db_initialized() -> Optional[Dict[str, Any]]:
+    """Initialize SQL tables, seed the 18 stations, and register the active model."""
+    try:
+        from db import bootstrap_database, register_model_run
+
+        summary = bootstrap_database()
+        bundle = load_model_bundle()
+        meta = bundle.get("metadata", {}) if isinstance(bundle, dict) else {}
+        if meta.get("pipeline_version"):
+            register_model_run(
+                model_version=str(meta["pipeline_version"]),
+                champion_name=str(meta.get("champion_name", "RandomForest")),
+                training_source=str(meta.get("training_source", "Open-Meteo NWP Archive")),
+                train_samples=int(meta.get("sample_count", 0) or 0),
+                bust_rate=float(meta.get("bust_rate", 0.0) or 0.0),
+                metrics=meta.get("metrics", {}) if isinstance(meta.get("metrics"), dict) else {},
+                global_drivers=meta.get("global_drivers", []) if isinstance(meta.get("global_drivers"), list) else [],
+                artifact_uri=MODEL_PATH.name,
+                set_active=True,
+            )
+            summary = bootstrap_database()
+        return summary
+    except Exception:
+        return None
+
+
+def read_db_summary_safe() -> Optional[Dict[str, Any]]:
+    """Read live DB row counts without blocking on transient connection hiccups."""
+    try:
+        from db import get_database_summary
+
+        return get_database_summary()
+    except Exception:
+        return None
 
 DRIVER_NOTES = {
     "pressure_drop": {
@@ -720,8 +737,11 @@ def _build_live_horizon_df(om_model: str) -> pd.DataFrame:
     """Transform 11-day Open-Meteo hourly series into 18x10 Day+1..Day+10 ML features."""
     payload = _fetch_open_meteo_grid(om_model)
     rows: List[Dict[str, Any]] = []
+    elevations: Dict[str, float] = {}
 
     for station, loc_data in zip(INDIAN_MET_STATIONS, payload):
+        if loc_data.get("elevation") is not None:
+            elevations[station["name"]] = float(loc_data["elevation"])
         hourly = loc_data.get("hourly", {})
         times = hourly.get("time", [])
         temps = hourly.get("temperature_2m", [])
@@ -777,7 +797,23 @@ def _build_live_horizon_df(om_model: str) -> pd.DataFrame:
                 "pressure_drop": round(float(np.clip(p_drop, 0.5, 30.0)), 2),
             })
 
-    return _score_station_rows(rows)
+    scored_df = _score_station_rows(rows)
+    try:
+        from db import seed_stations, upsert_forecast_snapshots
+
+        if elevations:
+            seed_stations(elevations=elevations)
+        bundle_meta = load_model_bundle().get("metadata", {})
+        ist_today = datetime.now(timezone(timedelta(hours=5, minutes=30))).date()
+        upsert_forecast_snapshots(
+            scored_df.to_dict(orient="records"),
+            nwp_model=om_model,
+            issued_date=ist_today,
+            model_version=str(bundle_meta.get("pipeline_version", "v2-india-archive-2682")),
+        )
+    except Exception:
+        pass
+    return scored_df
 
 
 @st.cache_data(show_spinner=False)
@@ -1214,16 +1250,20 @@ with st.sidebar:
         help="Stations at or above this risk score are marked red on the map.",
     )
 
+    db_summary = ensure_db_initialized()
     horizon_df, feed_label, is_live_feed = get_horizon_matrix(data_mode=data_mode, nwp_model=nwp_model)
     api_live = is_api_reachable()
     st.markdown("---")
     feed_dot = PALETTE["sage_green"] if is_live_feed else PALETTE["amber"]
     api_dot = PALETTE["sage_green"] if api_live else PALETTE["amber"]
     api_label = "FastAPI backend online" if api_live else "In-process ML bundle"
+    db_dot = PALETTE["sage_green"] if db_summary else PALETTE["amber"]
+    db_label = f"{db_summary['backend']} · {db_summary['location']}" if db_summary else "DB unavailable"
     st.markdown(
         f"<div class='mono-meta' style='line-height:1.7;'>"
         f"<span class='legend-dot' style='background:{feed_dot}; margin-right:6px;'></span>{feed_label}<br>"
-        f"<span class='legend-dot' style='background:{api_dot}; margin-right:6px;'></span>{api_label}"
+        f"<span class='legend-dot' style='background:{api_dot}; margin-right:6px;'></span>{api_label}<br>"
+        f"<span class='legend-dot' style='background:{db_dot}; margin-right:6px;'></span>{db_label}"
         f"</div>",
         unsafe_allow_html=True,
     )
@@ -1689,3 +1729,53 @@ with tab_bulletin:
             height=245,
         )
         st.plotly_chart(g_fig, width="stretch", config={"displayModeBar": False})
+
+    st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
+    st.markdown("**Database Persistence & Sync Status**")
+    live_db = read_db_summary_safe() or ensure_db_initialized()
+    if live_db:
+        st.markdown(
+            f"""
+<div class="kpi-grid" style="margin-top:8px;">
+  <div class="kpi-card" style="border-top: 3px solid {PALETTE['espresso']};">
+    <div class="kpi-label">Active Database</div>
+    <div class="kpi-value" style="color:{PALETTE['espresso']}; font-size:1.1rem;">{live_db['backend']}</div>
+    <div class="kpi-sub">{live_db['location']}</div>
+  </div>
+  <div class="kpi-card" style="border-top: 3px solid {PALETTE['terracotta']};">
+    <div class="kpi-label">Forecast Snapshots</div>
+    <div class="kpi-value" style="color:{PALETTE['terracotta']};">{live_db['forecast_runs']:,}</div>
+    <div class="kpi-sub">{live_db['stations']} synoptic stations seeded</div>
+  </div>
+  <div class="kpi-card" style="border-top: 3px solid {PALETTE['amber']};">
+    <div class="kpi-label">Verified Archive Pairs</div>
+    <div class="kpi-value" style="color:{PALETTE['espresso']};">{live_db['verified_pairs']:,}</div>
+    <div class="kpi-sub">{live_db['verification_outcomes']:,} Day-0 actual rows</div>
+  </div>
+  <div class="kpi-card" style="border-top: 3px solid {PALETTE['sage_green']};">
+    <div class="kpi-label">Registry & Audit Logs</div>
+    <div class="kpi-value" style="color:{PALETTE['sage_green']};">{live_db['model_runs']} / {live_db['prediction_logs']}</div>
+    <div class="kpi-sub">Models tracked / API predictions</div>
+  </div>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+        sync_col1, sync_col2 = st.columns([2, 1])
+        with sync_col1:
+            st.caption(
+                "Connect Supabase or Neon PostgreSQL anytime by setting `DATABASE_URL` in environment or Streamlit Secrets; "
+                "until then, records persist in local SQLite (`forecast_bust.db`)."
+            )
+        with sync_col2:
+            if st.button("Sync 150-Day Paired Archive to DB", width="stretch"):
+                with st.spinner("Syncing 150-day Open-Meteo paired archive into SQL database..."):
+                    from data_pipeline import sync_archive_to_database
+
+                    synced = sync_archive_to_database(past_days=150)
+                st.success(
+                    f"Synced {synced['forecast_runs']:,} forecast runs and {synced['verification_outcomes']:,} verification rows."
+                )
+                st.rerun()
+    else:
+        st.info("Database engine initializing or unavailable in this environment.")

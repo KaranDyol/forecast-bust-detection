@@ -14,33 +14,19 @@ This module is responsible for:
 4. Exporting a clean dataset ('processed_weather_data.csv') ready for ML training & SHAP explainability.
 """
 
+from datetime import date, timedelta
 import math
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import requests
 
+from stations_catalog import INDIAN_MET_STATIONS
+
 INDIA_ARCHIVE_STATIONS: List[Tuple[str, float, float]] = [
-    ("New Delhi (Safdarjung)", 28.5847, 77.2066),
-    ("Mumbai (Santacruz)", 19.0760, 72.8777),
-    ("Kolkata (Alipore)", 22.5726, 88.3639),
-    ("Chennai (Meenambakkam)", 13.0827, 80.2707),
-    ("Bengaluru (HAL)", 12.9716, 77.5946),
-    ("Hyderabad (Begumpet)", 17.3850, 78.4867),
-    ("Bhubaneswar (Airport)", 20.2961, 85.8245),
-    ("Srinagar (Rambagh)", 34.0837, 74.7973),
-    ("Guwahati (Borjhar)", 26.1445, 91.7362),
-    ("Ahmedabad (Airport)", 23.0225, 72.5714),
-    ("Jaipur (Sanganer)", 26.9124, 75.7873),
-    ("Nagpur (Sonegaon)", 21.1458, 79.0882),
-    ("Visakhapatnam (CWC)", 17.6868, 83.2185),
-    ("Kochi (CIAL)", 9.9312, 76.2673),
-    ("Patna (Aerodrome)", 25.5941, 85.1376),
-    ("Bhopal (Bairagarh)", 23.2599, 77.4126),
-    ("Pune (Shivajinagar)", 18.5204, 73.8567),
-    ("Dehradun (FRI)", 30.3165, 78.0322),
+    (s["name"], float(s["lat"]), float(s["lon"])) for s in INDIAN_MET_STATIONS
 ]
 
 PREVIOUS_RUNS_URL = "https://previous-runs-api.open-meteo.com/v1/forecast"
@@ -60,12 +46,15 @@ def _vector_wind_shear(w1: float, d1: float, w2: float, d2: float) -> float:
     return math.hypot(u2 - u1, v2 - v1)
 
 
-def fetch_open_meteo_archive_data(past_days: int = 150) -> pd.DataFrame:
+def fetch_open_meteo_archive_data(
+    past_days: int = 150,
+    include_metadata: bool = False,
+) -> pd.DataFrame:
     """
     Fetch real paired historical NWP forecasts (Day+3 run vs Day-0 verification)
     across 18 Indian synoptic stations via Open-Meteo's Previous Model Runs API.
     """
-    records = []
+    records: List[Dict[str, object]] = []
     for chunk_start in range(0, len(INDIA_ARCHIVE_STATIONS), 6):
         batch = INDIA_ARCHIVE_STATIONS[chunk_start : chunk_start + 6]
         params = {
@@ -83,10 +72,12 @@ def fetch_open_meteo_archive_data(past_days: int = 150) -> pd.DataFrame:
         if isinstance(payload, dict):
             payload = [payload]
 
-        for _station, loc in zip(batch, payload):
+        for (station_name, _lat, _lon), loc in zip(batch, payload):
             hourly = loc.get("hourly", {})
-            n_hours = len(hourly.get("time", []))
+            times = hourly.get("time", [])
+            n_hours = len(times)
             n_days = n_hours // 24
+            elevation_val = loc.get("elevation")
             for day_idx in range(1, n_days):
                 s = day_idx * 24
                 e = (day_idx + 1) * 24
@@ -117,17 +108,55 @@ def fetch_open_meteo_archive_data(past_days: int = 150) -> pd.DataFrame:
                 ]
                 if not (t_obs and t_pre and r_obs and r_pre):
                     continue
-                records.append({
+                valid_date_str = str(times[s])[:10]
+                issued_date_str = (date.fromisoformat(valid_date_str) - timedelta(days=3)).isoformat()
+                row: Dict[str, object] = {
                     "predicted_temp": round(max(t_pre), 2),
                     "actual_temp": round(max(t_obs), 2),
                     "predicted_rainfall": round(sum(r_pre), 2),
                     "actual_rainfall": round(sum(r_obs), 2),
                     "wind_shear": round(float(np.percentile(sh_list, 85)) if sh_list else 12.0, 2),
                     "pressure_drop": round(max([0.5] + pdrops), 2),
-                })
+                }
+                if include_metadata:
+                    row.update({
+                        "station_name": station_name,
+                        "valid_date": valid_date_str,
+                        "issued_date": issued_date_str,
+                        "lead_day": 3,
+                        "nwp_model": "open_meteo_day3",
+                        "elevation_m": float(elevation_val) if elevation_val is not None else None,
+                    })
+                records.append(row)
         time.sleep(0.5)
 
     return pd.DataFrame(records)
+
+
+def persist_archive_df_to_db(df_meta: pd.DataFrame) -> Dict[str, int]:
+    """Store paired archive rows (forecast_runs + verification_outcomes) into SQL storage."""
+    from db import seed_stations, upsert_forecast_snapshots, upsert_verification_outcomes
+
+    if df_meta.empty or "station_name" not in df_meta.columns:
+        return {"forecast_runs": 0, "verification_outcomes": 0}
+
+    elevations: Dict[str, float] = {}
+    if "elevation_m" in df_meta.columns:
+        for name, val in zip(df_meta["station_name"], df_meta["elevation_m"]):
+            if pd.notna(val):
+                elevations[str(name)] = float(val)
+    seed_stations(elevations=elevations)
+
+    records = df_meta.to_dict(orient="records")
+    n_forecasts = upsert_forecast_snapshots(records, nwp_model="open_meteo_day3")
+    n_verifs = upsert_verification_outcomes(records, source="open_meteo_day0")
+    return {"forecast_runs": n_forecasts, "verification_outcomes": n_verifs}
+
+
+def sync_archive_to_database(past_days: int = 150) -> Dict[str, int]:
+    """Fetch paired historical Day+3 forecasts vs Day-0 actuals and persist to DB."""
+    df_meta = fetch_open_meteo_archive_data(past_days=past_days, include_metadata=True)
+    return persist_archive_df_to_db(df_meta)
 
 
 def generate_synthetic_weather_data(
@@ -312,17 +341,22 @@ def run_pipeline(
     print("=" * 70)
 
     # 1. Ingestion / Generation
+    df_archive_meta: Optional[pd.DataFrame] = None
     if dataset_path and Path(dataset_path).exists():
         print(f"[+] Loading Kaggle Rattle dataset from: {dataset_path}")
         df_raw = load_rattle_weather_dataset(dataset_path)
     elif use_open_meteo_archive:
         try:
             print("[+] Fetching real paired NWP archive (Day+3 vs Day-0) from Open-Meteo...")
-            df_raw = fetch_open_meteo_archive_data(past_days=150)
-            if df_raw.empty:
+            df_archive_meta = fetch_open_meteo_archive_data(past_days=150, include_metadata=True)
+            if df_archive_meta.empty:
                 raise ValueError("Open-Meteo archive returned 0 rows.")
+            df_raw = df_archive_meta[
+                ["predicted_temp", "actual_temp", "predicted_rainfall", "actual_rainfall", "wind_shear", "pressure_drop"]
+            ].copy()
         except Exception as exc:
             print(f"[!] Open-Meteo archive fetch failed ({exc}); falling back to synthetic generation.")
+            df_archive_meta = None
             df_raw = generate_synthetic_weather_data(n_samples=n_synthetic_samples, random_state=random_state)
     else:
         if dataset_path:
@@ -347,10 +381,21 @@ def run_pipeline(
         rainfall_threshold=rainfall_threshold
     )
 
-    # 5. Persist Output
+    # 5. Persist CSV & Database Storage
     out_file = Path(output_path)
     df_final.to_csv(out_file, index=False)
     print(f"[+] Processed data successfully written to: {out_file.resolve()}")
+
+    if df_archive_meta is not None:
+        try:
+            db_counts = persist_archive_df_to_db(df_archive_meta)
+            print(
+                f"[+] Synced paired archive to database: "
+                f"{db_counts['forecast_runs']} forecast_runs, "
+                f"{db_counts['verification_outcomes']} verification_outcomes"
+            )
+        except Exception as exc:
+            print(f"[!] Database sync skipped: {exc}")
 
     # 6. Pipeline Summary
     total_records = len(df_final)

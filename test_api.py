@@ -23,6 +23,10 @@ def test_api():
         assert res_health.status_code == 200, f"Health check failed: {res_health.text}"
         print(f"[+] GET /health -> Status: {res_health.json()['status']}")
 
+        res_db = client.get("/db/health")
+        assert res_db.status_code == 200, f"DB health check failed: {res_db.text}"
+        print(f"[+] GET /db/health -> {res_db.json()['backend']} ({res_db.json()['stations']} stations)")
+
         # 2. Test Severe Weather Case (High Bust Probability expected)
         severe_payload = {
             "latitude": -33.8688,

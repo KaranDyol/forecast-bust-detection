@@ -63,6 +63,12 @@ except Exception as e:
 async def lifespan(app: FastAPI):
     """Lifespan event handler for ASGI lifecycle management."""
     load_model_bundle()
+    try:
+        from db import bootstrap_database
+
+        bootstrap_database()
+    except Exception as exc:
+        print(f"[!] Database bootstrap skipped during startup: {exc}")
     yield
 
 
@@ -238,6 +244,20 @@ def health():
     return {"status": "ready", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 
+@app.get("/db/health", tags=["System"])
+def database_health():
+    """Database backend status and row-count diagnostics."""
+    try:
+        from db import get_database_summary
+
+        return {"status": "connected", **get_database_summary()}
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Database unreachable: {str(exc)}",
+        )
+
+
 @app.post(
     "/predict_bust_risk",
     response_model=BustRiskResponse,
@@ -307,6 +327,23 @@ def predict_bust_risk(forecast_data: NWPForecastInput):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"SHAP explanation generation failed: {str(exc)}"
         )
+
+    try:
+        from db import log_prediction
+
+        log_prediction(
+            input_features=sample_dict,
+            risk_prob_pct=risk_percentage,
+            risk_level=risk_level,
+            shap_factors=[f.model_dump() for f in explainability_factors],
+            model_version=str(model_bundle.get("metadata", {}).get("pipeline_version", "legacy")),
+            latitude=forecast_data.latitude,
+            longitude=forecast_data.longitude,
+            lead_time_hours=forecast_data.lead_time_hours or 72,
+            source="api",
+        )
+    except Exception as exc:
+        print(f"[!] Prediction log skipped: {exc}")
 
     return BustRiskResponse(
         coordinates=CoordinateModel(

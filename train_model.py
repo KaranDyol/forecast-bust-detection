@@ -353,6 +353,7 @@ def train_and_build_bundle(
     raw_metrics = train_output["eval_results"][champion_name]
     clean_metrics = {k: v for k, v in raw_metrics.items() if k != "model"}
 
+    global_drivers_list = global_drivers.to_dict(orient="records")
     metadata = {
         "pipeline_version": PIPELINE_VERSION,
         "training_source": "Open-Meteo NWP Archive (18 Indian Stations, Day+3 vs Day-0)",
@@ -360,7 +361,7 @@ def train_and_build_bundle(
         "bust_rate": bust_rate,
         "champion_name": champion_name,
         "metrics": clean_metrics,
-        "global_drivers": global_drivers.to_dict(orient="records"),
+        "global_drivers": global_drivers_list,
     }
 
     if save_to_disk:
@@ -374,6 +375,23 @@ def train_and_build_bundle(
             )
         except OSError as exc:
             print(f"[!] Could not write model artifact to {model_destination}: {exc}")
+
+    try:
+        from db import register_model_run
+
+        register_model_run(
+            model_version=PIPELINE_VERSION,
+            champion_name=champion_name,
+            training_source=metadata["training_source"],
+            train_samples=sample_count,
+            bust_rate=bust_rate,
+            metrics=clean_metrics,
+            global_drivers=global_drivers_list,
+            artifact_uri=model_destination.name,
+            set_active=True,
+        )
+    except Exception as exc:
+        print(f"[!] Model registry DB update skipped: {exc}")
 
     return {
         "model": champion_model,
