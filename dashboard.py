@@ -1930,7 +1930,7 @@ def build_calibration_figure(fdf: pd.DataFrame) -> go.Figure:
 def build_station_scorecard_figure(fdf: pd.DataFrame) -> go.Figure:
     """Rank top synoptic stations or climatic regimes by observed bust frequency."""
     work = fdf.copy()
-    work["short_station"] = work["station_name"].str.split(" (").str[0]
+    work["short_station"] = work["station_name"].str.split(" (", regex=False).str[0]
     grp = (
         work.groupby("short_station", as_index=False)
         .agg(
@@ -2659,7 +2659,7 @@ with tab_diag:
                         lon=top_match["lon"],
                         label=top_match["label"],
                         state=top_match["admin1"] or top_match["country"] or None,
-                        switch_to_custom=True,
+                        switch_to_custom=False,
                     )
                     st.rerun()
                 else:
@@ -2675,7 +2675,7 @@ with tab_diag:
                         lon=picked["lon"],
                         label=picked["label"],
                         state=picked.get("admin1") or picked.get("country") or None,
-                        switch_to_custom=True,
+                        switch_to_custom=False,
                     )
 
             st.selectbox(
