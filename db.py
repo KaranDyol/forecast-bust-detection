@@ -241,7 +241,7 @@ def _dialect_upsert(
     rows: Sequence[Dict[str, Any]],
     conflict_cols: Sequence[str],
     update_cols: Sequence[str],
-    chunk_size: int = 200,
+    chunk_size: int = 50,
 ) -> int:
     """Execute idempotent upsert batches across SQLite and PostgreSQL."""
     if not rows:

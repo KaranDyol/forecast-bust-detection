@@ -583,31 +583,33 @@ button[data-baseweb="tab"][aria-selected="true"] {{
 
 
 @st.cache_resource(show_spinner=False)
-def load_model_bundle() -> Dict[str, Any]:
+def load_model_bundle(target_version: str = "v3-multihorizon-spread-10728") -> Dict[str, Any]:
     """Load the serialized model and SHAP TreeExplainer once per worker."""
-    target_version = "v3-multihorizon-spread-10728"
+    import importlib
+
     data_csv = BASE_DIR / "processed_weather_data.csv"
     bundle: Any = None
 
     if MODEL_PATH.is_file():
         bundle = joblib.load(MODEL_PATH)
         meta = bundle.get("metadata", {}) if isinstance(bundle, dict) else {}
-        if meta.get("pipeline_version") == target_version:
+        metrics = meta.get("metrics", {}) if isinstance(meta.get("metrics"), dict) else {}
+        if (
+            meta.get("pipeline_version") == target_version
+            and len(bundle.get("feature_names", [])) >= 9
+            and metrics.get("brier_score") is not None
+        ):
             return bundle
 
     if data_csv.is_file():
-        try:
-            from train_model import train_and_build_bundle
+        import train_model
 
-            return train_and_build_bundle(
-                csv_path=data_csv,
-                save_to_disk=True,
-                model_destination=MODEL_PATH,
-            )
-        except Exception:
-            if bundle is not None:
-                return bundle
-            raise
+        importlib.reload(train_model)
+        return train_model.train_and_build_bundle(
+            csv_path=data_csv,
+            save_to_disk=True,
+            model_destination=MODEL_PATH,
+        )
 
     if bundle is not None:
         return bundle
@@ -628,12 +630,25 @@ def is_api_reachable() -> bool:
 
 
 @st.cache_resource(show_spinner=False)
-def ensure_db_initialized() -> Optional[Dict[str, Any]]:
-    """Initialize SQL tables, seed the 18 stations, and register the active model."""
+def ensure_db_initialized(schema_version: str = "v3-multihorizon-spread-10728") -> Optional[Dict[str, Any]]:
+    """Initialize SQL tables, hydrate multi-horizon archive rows if needed, and register active model."""
     try:
+        import importlib
+        import data_pipeline
         from db import bootstrap_database, register_model_run
 
         summary = bootstrap_database()
+        data_csv = BASE_DIR / "processed_weather_data.csv"
+        if summary.get("forecast_runs", 0) < 5000 and data_csv.is_file():
+            try:
+                importlib.reload(data_pipeline)
+                df_csv = pd.read_csv(data_csv)
+                if "station_name" in df_csv.columns and "valid_date" in df_csv.columns:
+                    data_pipeline.persist_archive_df_to_db(df_csv)
+                    summary = bootstrap_database()
+            except Exception:
+                pass
+
         bundle = load_model_bundle()
         meta = bundle.get("metadata", {}) if isinstance(bundle, dict) else {}
         if meta.get("pipeline_version"):
@@ -2096,13 +2111,18 @@ with tab_bulletin:
             )
         with sync_col2:
             if st.button("Sync 150-Day Paired Archive to DB", width="stretch"):
-                with st.spinner("Syncing 150-day Open-Meteo paired archive into SQL database..."):
-                    from data_pipeline import sync_archive_to_database
+                try:
+                    with st.spinner("Syncing 150-day Open-Meteo multi-horizon archive into SQL database..."):
+                        import importlib
+                        import data_pipeline
 
-                    synced = sync_archive_to_database(past_days=150)
-                st.success(
-                    f"Synced {synced['forecast_runs']:,} forecast runs and {synced['verification_outcomes']:,} verification rows."
-                )
-                st.rerun()
+                        importlib.reload(data_pipeline)
+                        synced = data_pipeline.sync_archive_to_database(past_days=150)
+                    st.success(
+                        f"Synced {synced['forecast_runs']:,} forecast runs and {synced['verification_outcomes']:,} verification rows."
+                    )
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Archive sync failed: {exc}")
     else:
         st.info("Database engine initializing or unavailable in this environment.")

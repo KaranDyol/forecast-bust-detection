@@ -165,7 +165,11 @@ def _calibrate_classifier(
         if pos_count < 6:
             return base_estimator, "none", raw_pred, raw_prob
 
-        calibrated = CalibratedClassifierCV(estimator=clone(base_estimator), method="isotonic", cv=cv_folds)
+        import inspect
+
+        cal_params = inspect.signature(CalibratedClassifierCV.__init__).parameters
+        est_kw = "estimator" if "estimator" in cal_params else "base_estimator"
+        calibrated = CalibratedClassifierCV(**{est_kw: clone(base_estimator)}, method="isotonic", cv=cv_folds)
         calibrated.fit(X_train, y_train)
         cal_prob = calibrated.predict_proba(X_test)[:, 1]
         cal_pred = (cal_prob >= 0.5).astype(int)
